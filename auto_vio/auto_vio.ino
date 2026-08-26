@@ -125,15 +125,42 @@ volatile bool bleConnected = false;
 // passes needs a three-point turn rather than a waypoint beside the last one.
 enum AutoState {
   AUTO_IDLE,
-  AUTO_PASS,        // straight run along a lane; the only state that sprays
-  AUTO_TURN,        // full-lock 180 arc in the headland
-  AUTO_TURN_ALIGN,  // settle onto the chosen lane before spraying again
+  AUTO_PASS,          // straight run along a lane; the only state that sprays
+  AUTO_SHUFFLE_FWD,   // short forward leg at full lock
+  AUTO_SHUFFLE_REV,   // short reverse leg at opposite lock
+  AUTO_BACKOUT,       // reverse clear of the rectangle to make room to line up
+  AUTO_TURN_ALIGN,    // settle onto the chosen lane before spraying again
   AUTO_COMPLETE
 };
 AutoState state = AUTO_IDLE;
 
 inline bool isNavigating() {
-  return state == AUTO_PASS || state == AUTO_TURN || state == AUTO_TURN_ALIGN;
+  return state == AUTO_PASS || state == AUTO_SHUFFLE_FWD ||
+         state == AUTO_SHUFFLE_REV || state == AUTO_BACKOUT ||
+         state == AUTO_TURN_ALIGN;
+}
+
+// A full-lock arc sweeps sideways by the turning diameter -- several lane
+// widths, and wider than a small plot is across. So the 180 is done as a
+// sequence of short forward/reverse legs at opposite lock, which rotate the
+// rover while leaving it roughly where it started.
+const float SHUFFLE_LEG_FT      = 1.2f;
+const float ROTATION_DONE_DEG   = 170.0f;
+const float HEADLAND_MARGIN_FT  = 3.0f;
+const int   MAX_SHUFFLE_LEGS    = 24;
+
+bool turnRightward = true;
+int  shuffleLegs = 0;
+float legStartX = 0.0f, legStartY = 0.0f;
+
+inline float distanceFromLegStart() {
+  float dx = robotX_ft - legStartX;
+  float dy = robotY_ft - legStartY;
+  return sqrtf(dx * dx + dy * dy);
+}
+
+inline float rotationSoFar() {
+  return fabsf(angleDiffDeg(robotHeading, turnStartHeading));
 }
 
 // Lanes are no longer driven in index order: a full-lock 180 shifts sideways
@@ -307,7 +334,24 @@ void beginTurn() {
   setSpray(false);
   turnStartHeading = robotHeading;
   phaseStart = millis();
-  state = AUTO_TURN;
+  shuffleLegs = 0;
+  legStartX = robotX_ft;
+  legStartY = robotY_ft;
+
+  // Rotate toward whichever side still has uncovered lanes. Heading up, +X is
+  // to the rover's right; heading down it is to its left.
+  bool workToPositiveX = false;
+  for (int i = 0; i < totalLanes; i++) {
+    if (!laneCovered[i] &&
+        laneCenterX(i, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) > robotX_ft) {
+      workToPositiveX = true;
+      break;
+    }
+  }
+  turnRightward = passGoesUp ? workToPositiveX : !workToPositiveX;
+
+  state = AUTO_SHUFFLE_FWD;
+  bleLog(">>> Turning (" + String(turnRightward ? "right" : "left") + ")");
 }
 
 void runPass() {
@@ -336,55 +380,88 @@ void runPass() {
   }
 }
 
-// One full-lock 180. It displaces sideways by the turning diameter, which is
-// several lane widths, so rather than fight that we let it land where it
-// lands and then take the nearest lane still to be done -- which bounds the
-// remaining cross-track error at half a lane spacing regardless of how wide
-// the rover actually turns.
+// Once rotated, choose the lane and the end of the field to work from.
+void finishRotation() {
+  int lane = nearestUncoveredLane();
+  if (lane < 0) {
+    stopDrive();
+    state = AUTO_COMPLETE;
+    bleLog("=== MISSION COMPLETE ===");
+    return;
+  }
+  currentLane = lane;
+  // Whichever end we are nearer to is the end we set off from.
+  passGoesUp = (robotY_ft < fieldPassFt * 0.5f);
+  phaseStart = millis();
+  resetCourse();
+  state = AUTO_BACKOUT;
+  bleLog(">>> Lane " + String(lane + 1) + " next (x=" +
+         String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) +
+         ", off by " +
+         String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft, 2) +
+         " ft)");
+}
+
 void runTurn() {
   bool timedOut = (millis() - phaseStart > TURN_PHASE_TIMEOUT_MS);
 
-  if (state == AUTO_TURN) {
-    // Turn toward whichever side still has work, so the sweep is not wasted.
-    bool workToPositiveX = false;
-    for (int i = 0; i < totalLanes; i++) {
-      if (!laneCovered[i] &&
-          laneCenterX(i, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) > robotX_ft) {
-        workToPositiveX = true;
-        break;
-      }
+  // --- Rotate on the spot -------------------------------------------------
+  // Full lock one way going forward, full lock the other way reversing, both
+  // of which rotate the same direction. Legs are kept short so the rover
+  // pivots rather than driving a wide arc it has no room for.
+  if (state == AUTO_SHUFFLE_FWD || state == AUTO_SHUFFLE_REV) {
+    bool forward = (state == AUTO_SHUFFLE_FWD);
+    steerRightward((turnRightward == forward) ? MAX_STEER_OFFSET : -MAX_STEER_OFFSET);
+    setChannelPulse(ESC_CH, forward ? THROTTLE_TURN_US : THROTTLE_REV_US);
+
+    if (rotationSoFar() >= ROTATION_DONE_DEG) {
+      stopDrive();
+      finishRotation();
+      return;
     }
-    // Heading up, +X is to the rover's right; heading down it is to its left.
-    bool turnRight = passGoesUp ? workToPositiveX : !workToPositiveX;
 
-    steerRightward(turnRight ? MAX_STEER_OFFSET : -MAX_STEER_OFFSET);
-    setChannelPulse(ESC_CH, THROTTLE_TURN_US);
-
-    float turned = fabsf(angleDiffDeg(robotHeading, turnStartHeading));
-    if (turned >= 170.0f || timedOut) {
-      int lane = nearestUncoveredLane();
-      if (lane < 0) {
-        stopDrive();
-        state = AUTO_COMPLETE;
-        bleLog("=== MISSION COMPLETE ===");
+    if (distanceFromLegStart() >= SHUFFLE_LEG_FT || timedOut) {
+      stopDrive();
+      shuffleLegs++;
+      if (shuffleLegs >= MAX_SHUFFLE_LEGS) {
+        bleLog("!! Turn did not complete in " + String(MAX_SHUFFLE_LEGS) +
+               " legs; continuing anyway.");
+        finishRotation();
         return;
       }
-      currentLane = lane;
-      passGoesUp = (robotY_ft < fieldPassFt * 0.5f);
+      legStartX = robotX_ft;
+      legStartY = robotY_ft;
       phaseStart = millis();
-      resetCourse();
-      state = AUTO_TURN_ALIGN;
-      bleLog(">>> Aiming lane " + String(lane + 1) + " (x=" +
-             String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) +
-             ", off by " +
-             String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft, 2) +
-             " ft)");
+      state = forward ? AUTO_SHUFFLE_REV : AUTO_SHUFFLE_FWD;
     }
     return;
   }
 
-  // AUTO_TURN_ALIGN: settle onto the chosen lane out in the headland, before
-  // re-entering the rectangle, so the pass starts already on line.
+  // --- Back clear of the rectangle ---------------------------------------
+  // Reversing away from the field buys the run-up needed to settle onto the
+  // lane before re-entering, instead of converging halfway down it.
+  if (state == AUTO_BACKOUT) {
+    float wantY = passGoesUp ? -HEADLAND_MARGIN_FT
+                             : fieldPassFt + HEADLAND_MARGIN_FT;
+    bool clear = passGoesUp ? (robotY_ft <= wantY) : (robotY_ft >= wantY);
+
+    if (clear || timedOut) {
+      stopDrive();
+      phaseStart = millis();
+      resetCourse();
+      state = AUTO_TURN_ALIGN;
+      return;
+    }
+
+    // Reversing, so counter-steer: the back of the car leads.
+    float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+    float crossErr = laneX - robotX_ft;
+    steerRightward((passGoesUp ? -1.0f : 1.0f) * CROSS_TRACK_GAIN * crossErr);
+    setChannelPulse(ESC_CH, THROTTLE_REV_US);
+    return;
+  }
+
+  // --- Settle onto the lane ----------------------------------------------
   float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
   float desired = passDesiredHeading();
   holdLane(laneX, desired, passGoesUp);
@@ -394,8 +471,8 @@ void runTurn() {
   bool onLine = fabsf(laneX - robotX_ft) < ALIGN_TOL_FT;
   bool onHeading = fabsf(angleDiffDeg(desired, reference)) < ALIGN_HEADING_TOL;
 
-  // Do not keep aligning once the rectangle has been re-entered, or the top
-  // of the lane goes unsprayed while the rover is still converging.
+  // Never keep aligning past the boundary, or the near end of the lane goes
+  // unsprayed while the rover is still converging.
   bool enteringField = passGoesUp ? (robotY_ft > 0.0f) : (robotY_ft < fieldPassFt);
 
   if ((onLine && onHeading) || enteringField || timedOut) {
@@ -580,9 +657,11 @@ void loop() {
   if (millis() - lastTelemetryTime >= 1000) {
     lastTelemetryTime = millis();
     String phase = "IDLE";
-    if (state == AUTO_PASS)            phase = "RUN";
-    else if (state == AUTO_TURN)       phase = "TURN";
-    else if (state == AUTO_TURN_ALIGN) phase = "ALIGN";
+    if (state == AUTO_PASS)             phase = "RUN";
+    else if (state == AUTO_SHUFFLE_FWD) phase = "ROT-F";
+    else if (state == AUTO_SHUFFLE_REV) phase = "ROT-R";
+    else if (state == AUTO_BACKOUT)     phase = "BACK";
+    else if (state == AUTO_TURN_ALIGN)  phase = "ALIGN";
     else if (state == AUTO_COMPLETE)   phase = "DONE";
 
     bleLog("[TLM] " + phase +
