@@ -55,11 +55,14 @@ uint8_t laneAttempts[MAX_LANES];  // bounds retries so a bad lane cannot loop
 int totalLanes  = 0;
 int currentLane = 0;
 
-// Steering polarity. +1 means a pulse BELOW centre steers toward increasing
+// Steering polarity: +1 means a pulse BELOW centre steers toward increasing
 // heading (clockwise / to the rover's right), matching STEER_RIGHT_US < centre.
-// If Self Test shows the wheels going opposite to its printed labels, or the
-// rover consistently corrects the wrong way, flip this to -1.
-const int STEER_SIGN = 1;
+// Measured rather than assumed -- the first full-lock leg commands a known
+// direction, so comparing intent against the heading actually produced settles
+// it. Getting this backwards inverts every correction, which looks like
+// erratic wandering rather than an obvious fault.
+int  steerSign = 1;
+bool steerSignChecked = false;
 
 // Full lock is ~700us from centre, so at the old 90us/ft a rover a whole foot
 // off its lane asked for barely a tenth of the available steering and could
@@ -386,7 +389,7 @@ void runSelfTest() {
 // `rightward` > 0 steers toward increasing heading (rover's right).
 void steerRightward(float rightward) {
   rightward = constrain(rightward, -MAX_STEER_OFFSET, MAX_STEER_OFFSET);
-  int us = STEER_CENTER_US - (int)(STEER_SIGN * rightward);
+  int us = STEER_CENTER_US - (int)(steerSign * rightward);
   setChannelPulse(STEER_CH, constrain(us, STEER_RIGHT_US, STEER_LEFT_US));
 }
 
@@ -601,10 +604,27 @@ void runTurn() {
       stopDrive();
 
       // A full-lock leg traces an arc, so radius = distance / angle turned.
-      // One leg is enough, and it costs nothing extra to measure.
-      if (!radiusKnown) {
-        float legTurn = fabsf(angleDiffDeg(robotHeading, legStartHeading));
-        if (legTurn > 8.0f) {
+      // The same leg also reveals steering polarity: we commanded a known
+      // direction, so if the heading went the other way the wiring is
+      // reversed and every correction has been fighting itself.
+      float signedTurn = angleDiffDeg(robotHeading, legStartHeading);
+      float legTurn = fabsf(signedTurn);
+
+      if (legTurn > 8.0f) {
+        if (!steerSignChecked) {
+          steerSignChecked = true;
+          // Forward legs rotate toward the commanded side; reverse legs mirror.
+          bool expectClockwise = forward ? turnRightward : !turnRightward;
+          bool wentClockwise = signedTurn > 0.0f;
+          if (expectClockwise != wentClockwise) {
+            steerSign = -steerSign;
+            bleLog("!! Steering was reversed; polarity corrected automatically.");
+          } else {
+            bleLog("[OK] Steering polarity confirmed.");
+          }
+        }
+
+        if (!radiusKnown) {
           turnRadiusFt = distanceFromLegStart() / (legTurn * (float)M_PI / 180.0f);
           radiusKnown = true;
           chooseTurnStyle();
