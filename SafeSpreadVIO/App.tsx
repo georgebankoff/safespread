@@ -68,7 +68,6 @@ export default function App() {
 
   return (
     <View style={[styles.container, spraying && styles.containerSpraying]}>
-      <View style={styles.crosshair} />
       <View style={styles.hud}>
         <Text style={styles.text}>X: {pose.x.toFixed(1)} ft</Text>
         <Text style={styles.text}>Y: {pose.y.toFixed(1)} ft</Text>
@@ -100,7 +99,10 @@ export default function App() {
             placeholder="length"
             placeholderTextColor="#888"
           />
-          <Pressable style={styles.areaButton} onPress={applyArea}>
+          <Pressable
+            style={({ pressed }) => [styles.areaButton, pressed && styles.pressed]}
+            onPress={applyArea}
+          >
             <Text style={styles.buttonText}>Set</Text>
           </Pressable>
         </View>
@@ -124,7 +126,11 @@ export default function App() {
       </View>
       <View style={styles.modeRow}>
         <Pressable
-          style={[styles.modeButton, dryRun ? styles.modeDry : styles.modeWet]}
+          style={({ pressed }) => [
+            styles.modeButton,
+            dryRun ? styles.modeDry : styles.modeWet,
+            pressed && styles.pressed,
+          ]}
           onPress={() => ble.sendCommand('4')}
         >
           <Text style={styles.buttonText}>
@@ -134,7 +140,7 @@ export default function App() {
       </View>
       <View style={styles.buttons}>
         <Pressable
-          style={styles.button}
+          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
           onPress={() => {
             zero();
             ble.sendCommand('1');
@@ -142,10 +148,16 @@ export default function App() {
         >
           <Text style={styles.buttonText}>Start / Reset</Text>
         </Pressable>
-        <Pressable style={styles.button} onPress={() => ble.sendCommand('2')}>
+        <Pressable
+          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+          onPress={() => ble.sendCommand('2')}
+        >
           <Text style={styles.buttonText}>Stop</Text>
         </Pressable>
-        <Pressable style={styles.testButton} onPress={() => ble.sendCommand('3')}>
+        <Pressable
+          style={({ pressed }) => [styles.testButton, pressed && styles.pressed]}
+          onPress={() => ble.sendCommand('3')}
+        >
           <Text style={styles.buttonText}>Self Test</Text>
         </Pressable>
       </View>
@@ -156,19 +168,9 @@ export default function App() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black' },
   containerSpraying: { backgroundColor: '#b00020' },
-  crosshair: {
-    position: 'absolute',
-    top: '50%',
-    left: '50%',
-    width: 40,
-    height: 40,
-    marginLeft: -20,
-    marginTop: -20,
-    borderWidth: 2,
-    borderColor: 'white',
-    borderRadius: 20,
-  },
   hud: { position: 'absolute', top: 60, left: 20 },
+  // Pressed feedback: buttons dim while a finger is down.
+  pressed: { opacity: 0.6 },
   areaPanel: {
     position: 'absolute',
     top: 200,
