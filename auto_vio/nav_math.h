@@ -82,6 +82,42 @@ inline int buildWaypoints(float widthFt, float lengthFt, float barWidthFt,
   return idx;
 }
 
+// --- Pure pursuit --------------------------------------------------------
+// Steer at a point a fixed distance ahead on the planned path. Drift pulls the
+// lookahead point off to one side, which steers back onto the line, so the
+// rover recovers from error instead of re-deciding where it was going.
+
+/** Index of the route point nearest the rover, searched forward only so the
+ *  rover cannot latch onto an earlier part of a path that crosses itself. */
+template <typename PointT>
+inline int nearestRouteIndex(const PointT *route, int count, int fromIndex,
+                             float x, float y, int searchWindow) {
+  int best = fromIndex;
+  float bestDist = 1e18f;
+  int end = fromIndex + searchWindow;
+  if (end > count) end = count;
+  for (int i = fromIndex; i < end; i++) {
+    float dx = route[i].x - x;
+    float dy = route[i].y - y;
+    float d = dx * dx + dy * dy;
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best;
+}
+
+/** First point at least `lookaheadFt` beyond `fromIndex`. */
+template <typename PointT>
+inline int lookaheadRouteIndex(const PointT *route, int count, int fromIndex,
+                               float x, float y, float lookaheadFt) {
+  float need = lookaheadFt * lookaheadFt;
+  for (int i = fromIndex; i < count; i++) {
+    float dx = route[i].x - x;
+    float dy = route[i].y - y;
+    if (dx * dx + dy * dy >= need) return i;
+  }
+  return count - 1;
+}
+
 inline float angleDiffDeg(float target, float current) {
   float d = target - current;
   while (d > 180.0f) d -= 360.0f;
