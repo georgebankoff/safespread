@@ -1,19 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
 
 const ble = new SafeSpreadBLE();
 
 export default function App() {
-  const [permission, requestPermission] = useCameraPermissions();
   const { pose, trackingOk, zero } = useVIOPose();
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
-
-  useEffect(() => {
-    if (!permission?.granted) requestPermission();
-  }, [permission]);
 
   useEffect(() => {
     ble.connect(setStatus).catch(() => {});
@@ -31,18 +25,8 @@ export default function App() {
     return () => clearInterval(timer);
   }, [status, trackingOk, pose]);
 
-  if (!permission) return <View style={styles.container} />;
-  if (!permission.granted) {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.text}>Camera permission required</Text>
-      </View>
-    );
-  }
-
   return (
     <View style={styles.container}>
-      <CameraView style={StyleSheet.absoluteFill} facing="back" />
       <View style={styles.crosshair} />
       <View style={styles.hud}>
         <Text style={styles.text}>X: {pose.x.toFixed(1)} ft</Text>
