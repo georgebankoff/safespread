@@ -156,7 +156,7 @@ export default function App() {
             ble.sendCommand('1');
           }}
         >
-          <Text style={styles.buttonText}>{running ? 'Running…' : 'Start / Reset'}</Text>
+          <Text style={styles.buttonText}>{running ? 'Running…' : 'Start'}</Text>
         </Pressable>
         <Pressable
           style={({ pressed }) => [styles.button, pressed && styles.pressed]}
@@ -236,10 +236,24 @@ const styles = StyleSheet.create({
     left: 20,
     right: 20,
     flexDirection: 'row',
-    justifyContent: 'space-between',
+    gap: 10,
   },
-  button: { backgroundColor: '#2e7d32', paddingVertical: 14, paddingHorizontal: 24, borderRadius: 8 },
-  testButton: { backgroundColor: '#1565c0', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 8 },
+  // Equal widths so the row stays balanced regardless of label length
+  // ("Start" vs "Running…" vs "Self Test").
+  button: {
+    flex: 1,
+    backgroundColor: '#2e7d32',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  testButton: {
+    flex: 1,
+    backgroundColor: '#1565c0',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
   modeRow: {
     position: 'absolute',
     bottom: 104,
