@@ -51,6 +51,7 @@ const unsigned long VIO_TIMEOUT_MS = 1000;
 
 const int MAX_LANES = 64;
 bool laneCovered[MAX_LANES];
+uint8_t laneAttempts[MAX_LANES];  // bounds retries so a bad lane cannot loop
 int totalLanes  = 0;
 int currentLane = 0;
 
@@ -60,9 +61,17 @@ int currentLane = 0;
 // rover consistently corrects the wrong way, flip this to -1.
 const int STEER_SIGN = 1;
 
-const float CROSS_TRACK_GAIN = 90.0f;  // us of steering per ft off the lane
-const float HEADING_GAIN     = 14.0f;  // us of steering per degree of error
+// Full lock is ~700us from centre, so at the old 90us/ft a rover a whole foot
+// off its lane asked for barely a tenth of the available steering and could
+// not close that gap inside a short pass -- it just sprayed a diagonal. At
+// 250us/ft, a foot of error commands about a third of lock and ~2.8ft saturates.
+const float CROSS_TRACK_GAIN = 250.0f;  // us of steering per ft off the lane
+const float HEADING_GAIN     = 14.0f;   // us of steering per degree of error
 const float MAX_STEER_OFFSET = 700.0f;
+
+// Spray only while genuinely on the lane. Being inside the rectangle is not
+// enough: a pass crossing it diagonally is inside the whole way.
+const float SPRAY_ON_LANE_TOL_FT = 0.45f;
 
 const float PASS_END_TOL_FT   = 0.4f;
 const float ALIGN_TOL_FT      = 0.25f;
@@ -164,10 +173,16 @@ void chooseTurnStyle() {
 // widths, and wider than a small plot is across. So the 180 is done as a
 // sequence of short forward/reverse legs at opposite lock, which rotate the
 // rover while leaving it roughly where it started.
-const float SHUFFLE_LEG_FT      = 1.2f;
+// Longer legs mean fewer forward/reverse changes, and each change costs a
+// visible pause while the ESC passes through neutral to arm the other way.
+const float SHUFFLE_LEG_FT      = 2.0f;
 const float ROTATION_DONE_DEG   = 170.0f;
-const float HEADLAND_MARGIN_FT  = 3.0f;
-const int   MAX_SHUFFLE_LEGS    = 24;
+// Run-up for lining onto a lane. Too short and the rover reaches the boundary
+// still off-line, which is what forced the diagonal passes.
+const float HEADLAND_MARGIN_FT  = 5.0f;
+const int   MAX_SHUFFLE_LEGS    = 16;
+const int   MAX_ALIGN_RETRIES   = 2;
+int alignRetries = 0;
 
 bool turnRightward = true;
 int  shuffleLegs = 0;
@@ -285,7 +300,7 @@ void regenerateLanes() {
   totalLanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
   if (totalLanes > MAX_LANES) totalLanes = MAX_LANES;
   currentLane = 0;
-  for (int i = 0; i < MAX_LANES; i++) laneCovered[i] = false;
+  for (int i = 0; i < MAX_LANES; i++) { laneCovered[i] = false; laneAttempts[i] = 0; }
   float covered = laneCenterX(totalLanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
                   BAR_WIDTH_FT * 0.5f;
   bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
@@ -452,19 +467,36 @@ void beginTurn() {
 
 void runPass() {
   float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  float crossErr = fabsf(laneX - robotX_ft);
+
   holdLane(laneX, passDesiredHeading(), passGoesUp);
   setChannelPulse(ESC_CH, THROTTLE_FWD_US);
 
-  // Spray only on the straight run and only over the rectangle itself, so the
-  // path may overrun the ends but the wetted area stays a clean rectangle.
-  setSpray(insideField());
+  // On the straight run, over the rectangle, AND actually on the lane. Without
+  // the last test a pass that crosses the field diagonally sprays the whole
+  // way across, laying down stripes that are nowhere near the intended lanes.
+  setSpray(insideField() && crossErr <= SPRAY_ON_LANE_TOL_FT);
 
   float targetY = passTargetY();
   bool reached = passGoesUp ? (robotY_ft >= targetY - PASS_END_TOL_FT)
                             : (robotY_ft <= targetY + PASS_END_TOL_FT);
   if (reached) {
     setSpray(false);
-    laneCovered[currentLane] = true;
+
+    // Reaching the far end is not the same as having driven the lane. Only
+    // tick it off if we were actually on it, otherwise it would be recorded
+    // as done having been missed entirely.
+    if (crossErr <= SPRAY_ON_LANE_TOL_FT * 2.0f || laneAttempts[currentLane] >= 2) {
+      laneCovered[currentLane] = true;
+      if (crossErr > SPRAY_ON_LANE_TOL_FT * 2.0f) {
+        bleLog("!! Lane " + String(currentLane + 1) + " given up at " +
+               String(crossErr, 1) + " ft off.");
+      }
+    } else {
+      laneAttempts[currentLane]++;
+      bleLog("!! Lane " + String(currentLane + 1) + " missed by " +
+             String(crossErr, 1) + " ft; retrying.");
+    }
 
     if (lanesRemaining() == 0) {
       stopDrive();
@@ -591,13 +623,29 @@ void runTurn() {
   bool onLine = fabsf(laneX - robotX_ft) < ALIGN_TOL_FT;
   bool onHeading = fabsf(angleDiffDeg(desired, reference)) < ALIGN_HEADING_TOL;
 
-  // Never keep aligning past the boundary, or the near end of the lane goes
-  // unsprayed while the rover is still converging.
-  bool enteringField = passGoesUp ? (robotY_ft > 0.0f) : (robotY_ft < fieldPassFt);
-
-  if ((onLine && onHeading) || enteringField || timedOut) {
-    if (timedOut) bleLog("!! Align timed out; starting pass anyway.");
+  if (onLine && onHeading) {
+    alignRetries = 0;
     beginPass(currentLane);
+    return;
+  }
+
+  // Reaching the boundary still misaligned used to start the pass anyway,
+  // which is what produced diagonal sprayed lines. Back out and take another
+  // run-up instead -- bounded, so a lane that will not line up still ends.
+  bool enteringField = passGoesUp ? (robotY_ft > 0.0f) : (robotY_ft < fieldPassFt);
+  if (enteringField || timedOut) {
+    if (alignRetries >= MAX_ALIGN_RETRIES) {
+      bleLog("!! Align gave up " + String(fabsf(laneX - robotX_ft), 1) +
+             " ft off; starting anyway.");
+      alignRetries = 0;
+      beginPass(currentLane);
+    } else {
+      alignRetries++;
+      bleLog(">>> Re-approaching lane " + String(currentLane + 1) + " (" +
+             String(fabsf(laneX - robotX_ft), 1) + " ft off)");
+      phaseStart = millis();
+      state = AUTO_BACKOUT;
+    }
   }
 }
 
