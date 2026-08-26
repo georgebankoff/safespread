@@ -44,7 +44,7 @@ const int NEUTRAL_US = 1500;
 // charge all at once -- and one that just moved an empty rover will not move a
 // full one. Offsets are from neutral; the same magnitude is applied below
 // neutral to reverse.
-const float TARGET_SPEED_FPS   = 1.8f;
+const float TARGET_SPEED_FPS   = 1.2f;
 const float THROTTLE_MIN_OFFSET = 70.0f;   // past the ESC deadband
 const float THROTTLE_MAX_OFFSET = 400.0f;  // headroom for a full tank in grass
 const float THROTTLE_START_OFFSET = 150.0f;
@@ -176,7 +176,7 @@ unsigned long dirChangeAt = 0;
 
 // If the rover cannot reach the point it is tracking, skip past it rather than
 // grinding against it for the rest of the mission.
-const unsigned long STALL_TIMEOUT_MS = 8000;
+const unsigned long STALL_TIMEOUT_MS = 4000;
 int lastRouteIndex = -1;
 unsigned long routeIndexSince = 0;
 
@@ -376,6 +376,93 @@ void announceArea() {
          String(covered, 1) + " ft of width.");
 }
 
+#define QSLOTS 16
+#define QBYTES 32
+static uint8_t qData[QSLOTS][QBYTES];
+static uint8_t qLen[QSLOTS];
+static volatile uint8_t qHead = 0, qTail = 0;
+
+void queueWrite(const uint8_t *d, size_t n) {
+  uint8_t next = (qHead + 1) % QSLOTS;
+  if (next == qTail) return;
+  if (n > QBYTES) n = QBYTES;
+  memcpy(qData[qHead], d, n);
+  qLen[qHead] = n;
+  qHead = next;
+}
+
+// Pose packets arrive on the BLE queue and are only parsed when the queue is
+// drained, so anything that waits has to keep draining it or the rover's idea
+// of where it is stops updating mid-test.
+void pumpBle() {
+  while (qTail != qHead) {
+    feed(qData[qTail], qLen[qTail]);
+    qTail = (qTail + 1) % QSLOTS;
+  }
+}
+
+/** Drive briefly at the given pulse and report how far the rover moved along
+ *  its own nose: positive is forwards, negative is backwards. Returns false if
+ *  it did not really move. */
+bool measureDrive(int pulseUs, float &alongFt) {
+  float h = robotHeading * (float)M_PI / 180.0f;
+  setChannelPulse(STEER_CH, (int)steerCentreUs());
+
+  // An RC ESC needs to see neutral before it will accept the other direction.
+  setChannelPulse(ESC_CH, NEUTRAL_US);
+  for (unsigned long t = millis(); millis() - t < 800; ) { pumpBle(); delay(10); }
+
+  float x0 = robotX_ft, y0 = robotY_ft;
+  setChannelPulse(ESC_CH, pulseUs);
+  for (unsigned long t = millis(); millis() - t < 2000; ) { pumpBle(); delay(10); }
+  setChannelPulse(ESC_CH, NEUTRAL_US);
+  for (unsigned long t = millis(); millis() - t < 500; ) { pumpBle(); delay(10); }
+
+  float dx = robotX_ft - x0, dy = robotY_ft - y0;
+  alongFt = dx * sinf(h) + dy * cosf(h);
+  return fabsf(alongFt) > 0.25f;
+}
+
+// Whether the rover can actually back up is the one assumption the whole route
+// rests on: every lane change is a three-point turn, and an ESC that refuses
+// reverse turns each one into a circle rather than into an obvious fault. Ask
+// the rover to prove it rather than assuming it.
+void runDriveTest() {
+  bleLog("--- DRIVE TEST (rover will move a few ft each way) ---");
+  if (!vioActive) {
+    bleLog("[SKIP] No pose from the phone; cannot tell whether it moved.");
+    return;
+  }
+
+  float fwd = 0.0f, rev = 0.0f;
+  bool movedFwd = measureDrive(NEUTRAL_US + (int)THROTTLE_START_OFFSET, fwd);
+  bleLog("Forward: moved " + String(fwd, 2) + " ft along its nose.");
+  if (!movedFwd) {
+    bleLog("[FAIL] Did not move forward. Raise THROTTLE_START_OFFSET, or the");
+    bleLog("       drive battery / ESC is not delivering power.");
+  } else if (fwd < 0.0f) {
+    bleLog("[FAIL] Moved BACKWARDS on a forward command -- ESC is reversed.");
+  } else {
+    bleLog("[PASS] Forward works.");
+  }
+
+  bool movedRev = measureDrive(NEUTRAL_US - (int)THROTTLE_START_OFFSET, rev);
+  bleLog("Reverse: moved " + String(rev, 2) + " ft along its nose.");
+  if (!movedRev) {
+    bleLog("[FAIL] REVERSE DID NOT ENGAGE. This is fatal for the route: every");
+    bleLog("       lane change is a three-point turn, so each one becomes a");
+    bleLog("       circle instead. Many ESCs need a longer neutral, or a");
+    bleLog("       double-tap of reverse, before they will accept it.");
+  } else if (rev > 0.0f) {
+    bleLog("[FAIL] Moved FORWARDS on a reverse command -- no reverse available.");
+  } else {
+    bleLog("[PASS] Reverse works (" + String(-rev, 2) + " ft back).");
+  }
+
+  stopDrive();
+  bleLog("--- DRIVE TEST COMPLETE ---");
+}
+
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
 // without reflashing. Throttle stays at neutral throughout.
 void runSelfTest() {
@@ -444,6 +531,8 @@ void runSelfTest() {
   delay(1000);
   setSpray(false);
   bleLog("[INFO] Valve OFF.");
+
+  runDriveTest();
 
   bleLog("If I2C PASSed but the servo never moved:");
   bleLog("  -> 5V/V+ or GND screw terminal loose, or CH0 plug reversed.");
@@ -561,12 +650,28 @@ void runFollow() {
                                  robotX_ft, robotY_ft,
                                  ROUTE_SEARCH_WINDOW, CUSP_TOL_FT);
 
-  // A point it cannot reach must not hold up the rest of the mission.
+  // A point it cannot reach must not hold up the rest of the mission. Skip the
+  // whole rest of the leg, not one point: the points are half a foot apart, so
+  // stepping one at a time means grinding away at an unreachable target for
+  // minutes, steering hard the whole while -- which is what driving in circles
+  // actually was.
   if (routeIndex == lastRouteIndex) {
-    if (millis() - routeIndexSince > STALL_TIMEOUT_MS && routeIndex + 1 < routeCount) {
-      routeIndex++;
+    if (millis() - routeIndexSince > STALL_TIMEOUT_MS) {
+      int skipTo = segmentEndIndex(route, routeCount, routeIndex) + 1;
+      if (skipTo >= routeCount - 1) {
+        setSpray(false);
+        stopDrive();
+        state = AUTO_COMPLETE;
+        bleLog("!! Stuck on the last leg; stopping.");
+        return;
+      }
+      bleLog("!! Stuck at point " + String(routeIndex) + " for " +
+             String(STALL_TIMEOUT_MS / 1000) + "s; skipping to " + String(skipTo) + ".");
+      routeIndex = skipTo;
+      lastRouteIndex = routeIndex;
       routeIndexSince = millis();
-      bleLog("!! Stuck at point " + String(lastRouteIndex) + "; skipping ahead.");
+      escReverse = route[routeIndex].reverse;
+      dirChangeAt = millis();
     }
   } else {
     lastRouteIndex = routeIndex;
@@ -672,21 +777,6 @@ void runFollow() {
   }
 
   updateSpray();
-}
-
-#define QSLOTS 16
-#define QBYTES 32
-static uint8_t qData[QSLOTS][QBYTES];
-static uint8_t qLen[QSLOTS];
-static volatile uint8_t qHead = 0, qTail = 0;
-
-void queueWrite(const uint8_t *d, size_t n) {
-  uint8_t next = (qHead + 1) % QSLOTS;
-  if (next == qTail) return;
-  if (n > QBYTES) n = QBYTES;
-  memcpy(qData[qHead], d, n);
-  qLen[qHead] = n;
-  qHead = next;
 }
 
 static uint8_t acc[64];
