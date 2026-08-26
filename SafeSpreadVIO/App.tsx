@@ -122,6 +122,16 @@ export default function App() {
           ))}
         </ScrollView>
       </View>
+      <View style={styles.modeRow}>
+        <Pressable
+          style={[styles.modeButton, dryRun ? styles.modeDry : styles.modeWet]}
+          onPress={() => ble.sendCommand('4')}
+        >
+          <Text style={styles.buttonText}>
+            {dryRun ? 'DRY RUN — no spray' : 'WET — spraying enabled'}
+          </Text>
+        </Pressable>
+      </View>
       <View style={styles.buttons}>
         <Pressable
           style={styles.button}
@@ -137,12 +147,6 @@ export default function App() {
         </Pressable>
         <Pressable style={styles.testButton} onPress={() => ble.sendCommand('3')}>
           <Text style={styles.buttonText}>Self Test</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.modeButton, dryRun ? styles.modeDry : styles.modeWet]}
-          onPress={() => ble.sendCommand('4')}
-        >
-          <Text style={styles.buttonText}>{dryRun ? 'DRY' : 'WET'}</Text>
         </Pressable>
       </View>
     </View>
@@ -197,7 +201,7 @@ const styles = StyleSheet.create({
   roverPanel: {
     position: 'absolute',
     top: 330,
-    bottom: 120,
+    bottom: 164,
     left: 20,
     right: 20,
     backgroundColor: 'rgba(0,0,0,0.55)',
@@ -223,7 +227,13 @@ const styles = StyleSheet.create({
   },
   button: { backgroundColor: '#2e7d32', paddingVertical: 14, paddingHorizontal: 24, borderRadius: 8 },
   testButton: { backgroundColor: '#1565c0', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 8 },
-  modeButton: { paddingVertical: 14, paddingHorizontal: 18, borderRadius: 8 },
+  modeRow: {
+    position: 'absolute',
+    bottom: 104,
+    left: 20,
+    right: 20,
+  },
+  modeButton: { paddingVertical: 12, borderRadius: 8, alignItems: 'center' },
   modeDry: { backgroundColor: '#6a1b9a' },
   modeWet: { backgroundColor: '#ef6c00' },
   buttonText: { color: 'white', fontSize: 16, fontWeight: '700' },
