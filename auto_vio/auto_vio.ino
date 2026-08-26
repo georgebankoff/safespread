@@ -126,6 +126,7 @@ volatile bool bleConnected = false;
 enum AutoState {
   AUTO_IDLE,
   AUTO_PASS,          // straight run along a lane; the only state that sprays
+  AUTO_ARC,           // one smooth full-lock 180, when there is room for it
   AUTO_SHUFFLE_FWD,   // short forward leg at full lock
   AUTO_SHUFFLE_REV,   // short reverse leg at opposite lock
   AUTO_BACKOUT,       // reverse clear of the rectangle to make room to line up
@@ -135,9 +136,28 @@ enum AutoState {
 AutoState state = AUTO_IDLE;
 
 inline bool isNavigating() {
-  return state == AUTO_PASS || state == AUTO_SHUFFLE_FWD ||
-         state == AUTO_SHUFFLE_REV || state == AUTO_BACKOUT ||
-         state == AUTO_TURN_ALIGN;
+  return state == AUTO_PASS || state == AUTO_ARC ||
+         state == AUTO_SHUFFLE_FWD || state == AUTO_SHUFFLE_REV ||
+         state == AUTO_BACKOUT || state == AUTO_TURN_ALIGN;
+}
+
+// Turning circle, measured rather than assumed: a full-lock leg rotates by
+// (distance / radius), so one leg of the first turn gives the radius. With it
+// we can drive the turn a person would -- swing wide into a lane a few over
+// and pick up the skipped ones later -- and fall back to shuffling on the
+// spot only where a wide sweep genuinely will not fit.
+float turnRadiusFt = 0.0f;
+bool  radiusKnown  = false;
+bool  useWideTurn  = false;
+float legStartHeading = 0.0f;
+
+void chooseTurnStyle() {
+  // A wide 180 lands 2R to the side; it is only usable if that stays on the
+  // plot, otherwise the rover would swing clean off the area being covered.
+  useWideTurn = (2.0f * turnRadiusFt) <= (fieldWidthFt - BAR_WIDTH_FT);
+  bleLog("Turn radius ~" + String(turnRadiusFt, 1) + " ft (circle " +
+         String(2.0f * turnRadiusFt, 1) + " ft). Using " +
+         String(useWideTurn ? "wide sweeps." : "3-point turns: plot too narrow to sweep."));
 }
 
 // A full-lock arc sweeps sideways by the turning diameter -- several lane
@@ -221,6 +241,8 @@ void regenerateLanes() {
   bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
          " ft -> " + String(totalLanes) + " lanes, covering " +
          String(covered, 1) + " ft of width.");
+  // A plot that fitted a wide sweep may not once resized, and vice versa.
+  if (radiusKnown) chooseTurnStyle();
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
@@ -350,8 +372,10 @@ void beginTurn() {
   }
   turnRightward = passGoesUp ? workToPositiveX : !workToPositiveX;
 
-  state = AUTO_SHUFFLE_FWD;
-  bleLog(">>> Turning (" + String(turnRightward ? "right" : "left") + ")");
+  legStartHeading = robotHeading;
+  state = (radiusKnown && useWideTurn) ? AUTO_ARC : AUTO_SHUFFLE_FWD;
+  bleLog(">>> Turning " + String(turnRightward ? "right" : "left") + " (" +
+         String(state == AUTO_ARC ? "sweep" : "3-point") + ")");
 }
 
 void runPass() {
@@ -405,6 +429,17 @@ void finishRotation() {
 void runTurn() {
   bool timedOut = (millis() - phaseStart > TURN_PHASE_TIMEOUT_MS);
 
+  // --- One smooth sweep, the way a driver turns with room to spare --------
+  if (state == AUTO_ARC) {
+    steerRightward(turnRightward ? MAX_STEER_OFFSET : -MAX_STEER_OFFSET);
+    setChannelPulse(ESC_CH, THROTTLE_TURN_US);
+    if (rotationSoFar() >= ROTATION_DONE_DEG || timedOut) {
+      stopDrive();
+      finishRotation();
+    }
+    return;
+  }
+
   // --- Rotate on the spot -------------------------------------------------
   // Full lock one way going forward, full lock the other way reversing, both
   // of which rotate the same direction. Legs are kept short so the rover
@@ -422,6 +457,18 @@ void runTurn() {
 
     if (distanceFromLegStart() >= SHUFFLE_LEG_FT || timedOut) {
       stopDrive();
+
+      // A full-lock leg traces an arc, so radius = distance / angle turned.
+      // One leg is enough, and it costs nothing extra to measure.
+      if (!radiusKnown) {
+        float legTurn = fabsf(angleDiffDeg(robotHeading, legStartHeading));
+        if (legTurn > 8.0f) {
+          turnRadiusFt = distanceFromLegStart() / (legTurn * (float)M_PI / 180.0f);
+          radiusKnown = true;
+          chooseTurnStyle();
+        }
+      }
+
       shuffleLegs++;
       if (shuffleLegs >= MAX_SHUFFLE_LEGS) {
         bleLog("!! Turn did not complete in " + String(MAX_SHUFFLE_LEGS) +
@@ -431,6 +478,7 @@ void runTurn() {
       }
       legStartX = robotX_ft;
       legStartY = robotY_ft;
+      legStartHeading = robotHeading;
       phaseStart = millis();
       state = forward ? AUTO_SHUFFLE_REV : AUTO_SHUFFLE_FWD;
     }
@@ -658,6 +706,7 @@ void loop() {
     lastTelemetryTime = millis();
     String phase = "IDLE";
     if (state == AUTO_PASS)             phase = "RUN";
+    else if (state == AUTO_ARC)         phase = "SWEEP";
     else if (state == AUTO_SHUFFLE_FWD) phase = "ROT-F";
     else if (state == AUTO_SHUFFLE_REV) phase = "ROT-R";
     else if (state == AUTO_BACKOUT)     phase = "BACK";
