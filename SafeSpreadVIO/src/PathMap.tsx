@@ -1,28 +1,37 @@
 import React from 'react';
 import { Modal, Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { PathPoint, computeViewBox, projector } from './pathMath';
+import { RectangleDefinition } from './rectangle';
 
 interface Props {
   visible: boolean;
   onClose: () => void;
-  widthFt: number;
-  lengthFt: number;
+  definition: RectangleDefinition;
   points: PathPoint[];
 }
 
 const DOT = 4;
 
-export default function PathMap({ visible, onClose, widthFt, lengthFt, points }: Props) {
+export default function PathMap({ visible, onClose, definition, points }: Props) {
   const { width: screenW, height: screenH } = useWindowDimensions();
   const canvasW = screenW - 40;
   const canvasH = screenH - 240;
 
-  const box = computeViewBox(widthFt, lengthFt, points);
+  const extents: PathPoint[] = [
+    { x: 0, y: -definition.startClearFt, spraying: false },
+    { x: definition.nFt, y: definition.mFt + definition.endClearFt, spraying: false },
+  ];
+  const box = computeViewBox(definition.nFt, definition.mFt, [...points, ...extents]);
   const { toPx, scale } = projector(box, canvasW, canvasH);
 
-  const rectTopLeft = toPx(0, lengthFt);
-  const rectW = widthFt * scale;
-  const rectH = lengthFt * scale;
+  const rectTopLeft = toPx(0, definition.mFt);
+  const rectW = definition.nFt * scale;
+  const rectH = definition.mFt * scale;
+  const origin = toPx(0, 0);
+  const farM = toPx(0, definition.mFt);
+  const farN = toPx(definition.nFt, 0);
+  const startHeadland = toPx(0, 0);
+  const endHeadland = toPx(0, definition.mFt + definition.endClearFt);
 
   const sprayed = points.filter((p) => p.spraying).length;
 
@@ -30,7 +39,10 @@ export default function PathMap({ visible, onClose, widthFt, lengthFt, points }:
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <View style={styles.container}>
         <Text style={styles.title}>
-          {lengthFt.toFixed(1)} × {widthFt.toFixed(1)} ft
+          M {definition.mFt.toFixed(1)} × N {definition.nFt.toFixed(1)} ft
+        </Text>
+        <Text style={styles.orientation}>
+          N extends {definition.side}; {definition.source} rectangle
         </Text>
         <Text style={styles.legend}>
           <Text style={styles.spraySwatch}>■</Text> sprayed ({sprayed}) {'   '}
@@ -51,6 +63,38 @@ export default function PathMap({ visible, onClose, widthFt, lengthFt, points }:
             ]}
           />
 
+          {definition.startClearFt > 0 ? (
+            <View style={[styles.headland, {
+              left: startHeadland.left,
+              top: startHeadland.top,
+              width: rectW,
+              height: definition.startClearFt * scale,
+            }]} />
+          ) : null}
+          {definition.endClearFt > 0 ? (
+            <View style={[styles.headland, {
+              left: endHeadland.left,
+              top: endHeadland.top,
+              width: rectW,
+              height: definition.endClearFt * scale,
+            }]} />
+          ) : null}
+
+          <View style={[styles.axis, {
+            left: origin.left,
+            top: farM.top,
+            width: 2,
+            height: origin.top - farM.top,
+          }]} />
+          <Text style={[styles.axisLabel, { left: farM.left + 5, top: farM.top }]}>M ↑</Text>
+          <View style={[styles.axis, {
+            left: origin.left,
+            top: origin.top,
+            width: farN.left - origin.left,
+            height: 2,
+          }]} />
+          <Text style={[styles.axisLabel, { left: farN.left - 38, top: farN.top - 20 }]}>N →</Text>
+
           {points.map((p, i) => {
             const { left, top } = toPx(p.x, p.y);
             return (
@@ -66,10 +110,7 @@ export default function PathMap({ visible, onClose, widthFt, lengthFt, points }:
           })}
 
           {/* Where the rover started: the corner everything is measured from */}
-          {(() => {
-            const o = toPx(0, 0);
-            return <View style={[styles.origin, { left: o.left - 5, top: o.top - 5 }]} />;
-          })()}
+          <View style={[styles.origin, { left: origin.left - 5, top: origin.top - 5 }]} />
         </View>
 
         {points.length === 0 ? (
@@ -90,6 +131,7 @@ export default function PathMap({ visible, onClose, widthFt, lengthFt, points }:
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#111', paddingTop: 60, alignItems: 'center' },
   title: { color: 'white', fontSize: 18, fontWeight: '700', marginBottom: 4 },
+  orientation: { color: '#9ecbff', fontSize: 13, marginBottom: 4 },
   legend: { color: '#bbb', fontSize: 13, marginBottom: 12 },
   spraySwatch: { color: '#ff5252' },
   travelSwatch: { color: '#5a5a5a' },
@@ -100,6 +142,14 @@ const styles = StyleSheet.create({
     borderColor: '#2e7d32',
     backgroundColor: 'rgba(46,125,50,0.12)',
   },
+  headland: {
+    position: 'absolute',
+    borderWidth: 1,
+    borderColor: '#8d6e63',
+    backgroundColor: 'rgba(141,110,99,0.15)',
+  },
+  axis: { position: 'absolute', backgroundColor: '#ffd54f' },
+  axisLabel: { position: 'absolute', color: '#ffd54f', fontSize: 12, fontWeight: '700' },
   dot: { position: 'absolute', width: DOT, height: DOT, borderRadius: DOT / 2 },
   dotSpray: { backgroundColor: '#ff5252' },
   dotTravel: { backgroundColor: '#5a5a5a' },

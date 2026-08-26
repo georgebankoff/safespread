@@ -14,6 +14,7 @@ import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
 import PathMap from './src/PathMap';
 import { PathPoint, MAX_PATH_POINTS, shouldRecord } from './src/pathMath';
+import { defineEnteredRectangle, RectangleDefinition, worldToRectangle } from './src/rectangle';
 
 const ble = new SafeSpreadBLE();
 
@@ -39,7 +40,7 @@ export default function App() {
   const [sentCount, setSentCount] = useState(0);
   const [path, setPath] = useState<PathPoint[]>([]);
   const [mapOpen, setMapOpen] = useState(false);
-  const [mapDims, setMapDims] = useState({ n: 21.9, m: 21.9 });
+  const [activeRectangle, setActiveRectangle] = useState<RectangleDefinition | null>(null);
   const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
@@ -51,7 +52,7 @@ export default function App() {
       return;
     }
     ble.sendArea(n, m);
-    setAreaNote(`Sent ${n} × ${m} ft (${Math.round(n * m)} sqft)`);
+    setAreaNote(`Sent M ${m} × N ${n} ft (${Math.round(n * m)} sqft)`);
   };
 
   // Keep beeping even with the ringer switch flipped to silent, which is where
@@ -98,23 +99,26 @@ export default function App() {
   // Read through refs, and depend on nothing: `pose` is a fresh object every
   // ARKit frame (~60Hz), so listing it here would clear and recreate the
   // interval every ~16ms and the 100ms tick would never once fire.
-  const sendStateRef = useRef({ pose, status, trackingOk, spraying, running });
-  sendStateRef.current = { pose, status, trackingOk, spraying, running };
+  const sendStateRef = useRef({ pose, status, trackingOk, spraying, running, activeRectangle });
+  sendStateRef.current = { pose, status, trackingOk, spraying, running, activeRectangle };
 
   useEffect(() => {
     const timer = setInterval(() => {
       const current = sendStateRef.current;
-      if (current.pose && current.status === 'connected' && current.trackingOk) {
-        ble.sendPose(current.pose.x, current.pose.y, current.pose.heading);
+      const rectanglePose = current.pose && current.activeRectangle
+        ? worldToRectangle(current.pose, current.activeRectangle)
+        : null;
+      if (rectanglePose && current.status === 'connected' && current.trackingOk) {
+        ble.sendPose(rectanglePose.x, rectanglePose.y, rectanglePose.heading);
         setSentCount((n) => n + 1);
       }
 
       // Trace the mission, including the headland turns, so the map shows the
       // real path and not just the sprayed parts.
-      if (current.pose && current.running) {
+      if (rectanglePose && current.running) {
         const next: PathPoint = {
-          x: current.pose.x,
-          y: current.pose.y,
+          x: rectanglePose.x,
+          y: rectanglePose.y,
           spraying: current.spraying,
         };
         setPath((prev) =>
@@ -143,24 +147,24 @@ export default function App() {
 
       <View style={styles.areaPanel}>
         <Text style={styles.label}>
-          Area (ft) — N: straight ahead, M: out to the right
+          Rectangle (ft) — M: pass length, N: coverage width to the right
         </Text>
         <View style={styles.areaRow}>
-          <TextInput
-            style={styles.input}
-            value={nText}
-            onChangeText={setNText}
-            keyboardType="decimal-pad"
-            placeholder="N"
-            placeholderTextColor="#888"
-          />
-          <Text style={styles.times}>×</Text>
           <TextInput
             style={styles.input}
             value={mText}
             onChangeText={setMText}
             keyboardType="decimal-pad"
             placeholder="M"
+            placeholderTextColor="#888"
+          />
+          <Text style={styles.times}>×</Text>
+          <TextInput
+            style={styles.input}
+            value={nText}
+            onChangeText={setNText}
+            keyboardType="decimal-pad"
+            placeholder="N"
             placeholderTextColor="#888"
           />
           <Pressable
@@ -204,17 +208,32 @@ export default function App() {
       </View>
       <View style={styles.buttons}>
         <Pressable
-          disabled={running}
+          disabled={running || !pose || !trackingOk}
           style={({ pressed }) => [
             styles.button,
-            running && styles.disabled,
+            (running || !pose || !trackingOk) && styles.disabled,
             pressed && styles.pressed,
           ]}
           onPress={() => {
+            if (!pose || !trackingOk) return;
+            let definition: RectangleDefinition;
+            try {
+              definition = defineEnteredRectangle(
+                pose,
+                parseFloat(mText),
+                parseFloat(nText),
+                'right',
+                0,
+                0,
+              );
+            } catch {
+              setAreaNote('Enter positive M and N dimensions before starting');
+              return;
+            }
             // The old trace belongs to the previous run; rectangle-frame
             // coordinates are established by setup, not by this pose hook.
             setPath([]);
-            setMapDims({ n: parseFloat(nText) || 0, m: parseFloat(mText) || 0 });
+            setActiveRectangle(definition);
             ble.sendCommand('1');
           }}
         >
@@ -240,13 +259,14 @@ export default function App() {
         </Pressable>
       </View>
 
-      <PathMap
-        visible={mapOpen}
-        onClose={() => setMapOpen(false)}
-        widthFt={mapDims.m}
-        lengthFt={mapDims.n}
-        points={path}
-      />
+      {activeRectangle ? (
+        <PathMap
+          visible={mapOpen}
+          onClose={() => setMapOpen(false)}
+          definition={activeRectangle}
+          points={path}
+        />
+      ) : null}
     </View>
   );
 }
