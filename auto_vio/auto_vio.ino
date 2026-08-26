@@ -70,6 +70,18 @@ const unsigned long TURN_PHASE_TIMEOUT_MS = 6000;
 float turnStartHeading = 0.0f;
 unsigned long phaseStart = 0;
 
+// Course over ground: the direction the rover is actually travelling, taken
+// from successive positions rather than from which way the phone points.
+// Any constant yaw error in how the phone is mounted cancels out of this,
+// which it does not for the reported heading -- and with the phone's heading
+// a mounting error of a few degrees biases lane tracking in opposite
+// directions on outbound and return passes, striping the coverage.
+float prevSampleX = 0.0f, prevSampleY = 0.0f;
+float courseDeg = 0.0f;
+bool  courseValid = false;
+const float COURSE_MIN_STEP_FT = 0.20f;  // ignore jitter below real motion
+const float COURSE_SMOOTHING   = 0.35f;
+
 float robotX_ft    = 0.0f;
 float robotY_ft    = 0.0f;
 float robotHeading = 0.0f;
@@ -79,6 +91,29 @@ unsigned long lastTelemetryTime = 0;
 unsigned long packetCount = 0;
 bool dryRunMode  = false;
 bool sprayActive = false;
+
+void resetCourse() {
+  courseValid = false;
+  prevSampleX = robotX_ft;
+  prevSampleY = robotY_ft;
+}
+
+void updateCourse() {
+  float dx = robotX_ft - prevSampleX;
+  float dy = robotY_ft - prevSampleY;
+  if (sqrtf(dx * dx + dy * dy) < COURSE_MIN_STEP_FT) return;
+
+  float sample = bearingToWaypointDeg(dx, dy);
+  if (!courseValid) {
+    courseDeg = sample;
+    courseValid = true;
+  } else {
+    courseDeg = fmodf(courseDeg + COURSE_SMOOTHING * angleDiffDeg(sample, courseDeg) +
+                      360.0f, 360.0f);
+  }
+  prevSampleX = robotX_ft;
+  prevSampleY = robotY_ft;
+}
 
 Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
 BLECharacteristic *txCharacteristic = NULL;
@@ -218,7 +253,12 @@ void steerRightward(float rightward) {
 void holdLane(float laneX, float desiredHeading, bool goingUp) {
   float crossErr = laneX - robotX_ft;
   float crossTerm = (goingUp ? 1.0f : -1.0f) * CROSS_TRACK_GAIN * crossErr;
-  float headingTerm = HEADING_GAIN * angleDiffDeg(desiredHeading, robotHeading);
+
+  // Prefer measured course while it is trustworthy, so the phone's mounting
+  // angle drops out; fall back to reported heading when barely moving.
+  float reference = courseValid ? courseDeg : robotHeading;
+  float headingTerm = HEADING_GAIN * angleDiffDeg(desiredHeading, reference);
+
   steerRightward(crossTerm + headingTerm);
 }
 
@@ -230,6 +270,7 @@ bool insideField() {
 void beginPass(int lane) {
   currentLane = lane;
   phaseStart = millis();
+  resetCourse();
   state = AUTO_PASS;
   bleLog(">>> Pass " + String(lane + 1) + "/" + String(totalLanes) + " at x=" +
          String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) + " ft");
@@ -296,6 +337,7 @@ void runTurn() {
     if (turned >= 165.0f || timedOut) {
       stopDrive();
       phaseStart = millis();
+      resetCourse();  // course ran backwards through the reverse leg
       state = AUTO_TURN_ALIGN;
     }
     return;
@@ -404,6 +446,8 @@ void feed(const uint8_t *d, size_t n) {
       vioActive = true;
       lastVioTime = millis();
       packetCount++;
+      // Only meaningful while driving forward, so leave it alone mid-turn.
+      if (state == AUTO_PASS || state == AUTO_TURN_ALIGN) updateCourse();
       i += 15;
     } else {
       i++;
