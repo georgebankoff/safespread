@@ -89,6 +89,56 @@ void bleLog(String msg) {
   }
 }
 
+// Port of diagnostics.ino, callable at runtime so wiring can be checked
+// without reflashing. Throttle stays at neutral throughout -- this only
+// exercises steering, never drives the motor.
+void runSelfTest() {
+  bleLog("=== SELF TEST ===");
+
+  Wire.beginTransmission(PCA9685_ADDR);
+  byte error = Wire.endTransmission();
+
+  if (error != 0) {
+    if (error == 2) {
+      bleLog("[FAIL] I2C NACK - PCA9685 not found at 0x40.");
+      bleLog("       Check VCC/GND on the PCA9685 logic header.");
+    } else if (error == 5) {
+      bleLog("[FAIL] I2C timeout / bus lockup.");
+      bleLog("       Check SDA/SCL wires for breaks or shorts.");
+    } else {
+      bleLog("[FAIL] I2C error code " + String(error));
+    }
+    bleLog("=== SELF TEST ABORTED ===");
+    return;
+  }
+
+  bleLog("[PASS] I2C OK (PCA9685 @ 0x40)");
+
+  setChannelPulse(ESC_CH, NEUTRAL_US);
+
+  bleLog("[INFO] Steering LEFT (" + String(STEER_LEFT_US) + "us)...");
+  setChannelPulse(STEER_CH, STEER_LEFT_US);
+  delay(1000);
+
+  bleLog("[INFO] Steering RIGHT (" + String(STEER_RIGHT_US) + "us)...");
+  setChannelPulse(STEER_CH, STEER_RIGHT_US);
+  delay(1000);
+
+  bleLog("[INFO] Steering CENTER (" + String(STEER_CENTER_US) + "us)...");
+  setChannelPulse(STEER_CH, STEER_CENTER_US);
+  delay(500);
+
+  bleLog("[INFO] Valve ON 1s...");
+  setSpray(true);
+  delay(1000);
+  setSpray(false);
+  bleLog("[INFO] Valve OFF.");
+
+  bleLog("If I2C PASSed but the servo never moved:");
+  bleLog("  -> 5V/V+ or GND screw terminal loose, or CH0 plug reversed.");
+  bleLog("=== SELF TEST COMPLETE ===");
+}
+
 void navigateToWaypoint(const Waypoint &wp) {
   float dx = wp.x - robotX_ft;
   float dy = wp.y - robotY_ft;
@@ -155,6 +205,13 @@ void feed(const uint8_t *d, size_t n) {
       stopDrive();
       setSpray(false);
       bleLog(">>> Mission stopped.");
+    } else if (d[0] == '3') {
+      if (state == AUTO_NAVIGATING) {
+        bleLog("!! Self test refused: stop the mission first.");
+      } else {
+        runSelfTest();
+        stopDrive();
+      }
     }
     return;
   }

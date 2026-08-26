@@ -48,6 +48,9 @@ export default function App() {
         <Pressable style={styles.button} onPress={() => ble.sendCommand('2')}>
           <Text style={styles.buttonText}>Stop</Text>
         </Pressable>
+        <Pressable style={styles.testButton} onPress={() => ble.sendCommand('3')}>
+          <Text style={styles.buttonText}>Self Test</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -78,5 +81,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   button: { backgroundColor: '#2e7d32', paddingVertical: 14, paddingHorizontal: 24, borderRadius: 8 },
+  testButton: { backgroundColor: '#1565c0', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 8 },
   buttonText: { color: 'white', fontSize: 16, fontWeight: '700' },
 });
