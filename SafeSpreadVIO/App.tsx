@@ -8,12 +8,17 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { useKeepAwake } from 'expo-keep-awake';
 import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
 
 const ble = new SafeSpreadBLE();
 
 export default function App() {
+  // The screen locking would suspend ARKit and the BLE writes with it,
+  // stranding the rover mid-pass until its VIO timeout stops it.
+  useKeepAwake();
+
   const { pose, trackingState, trackingOk, zero } = useVIOPose();
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [nText, setNText] = useState('21.9');
