@@ -55,6 +55,8 @@ float robotY_ft    = 0.0f;
 float robotHeading = 0.0f;
 bool  vioActive    = false;
 unsigned long lastVioTime = 0;
+unsigned long lastTelemetryTime = 0;
+unsigned long packetCount = 0;
 
 Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
 BLECharacteristic *txCharacteristic = NULL;
@@ -172,6 +174,7 @@ void feed(const uint8_t *d, size_t n) {
       robotHeading = heading;
       vioActive = true;
       lastVioTime = millis();
+      packetCount++;
       i += 15;
     } else {
       i++;
@@ -244,6 +247,18 @@ void loop() {
   while (qTail != qHead) {
     feed(qData[qTail], qLen[qTail]);
     qTail = (qTail + 1) % QSLOTS;
+  }
+
+  // 1Hz telemetry so a silent rover is diagnosable: distinguishes "no pose
+  // packets arriving" from "packets fine, navigation misbehaving".
+  if (millis() - lastTelemetryTime >= 1000) {
+    lastTelemetryTime = millis();
+    Serial.println("[TLM] state=" + String((int)state) +
+                   " vio=" + String(vioActive ? "OK" : "NONE") +
+                   " pkts=" + String(packetCount) +
+                   " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
+                   " hdg=" + String(robotHeading, 0) +
+                   " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount));
   }
 
   if (vioActive && (millis() - lastVioTime > VIO_TIMEOUT_MS)) {
