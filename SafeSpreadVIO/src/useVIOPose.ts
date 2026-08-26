@@ -11,7 +11,9 @@ export function useVIOPose() {
   useEffect(() => {
     ArkitPoseModule.start();
     const subscription = ArkitPoseModule.addListener('onPoseUpdate', (event) => {
-      setRaw({ x: event.x, y: event.y, heading: event.heading });
+      if (event.kind === 'pose') {
+        setRaw({ x: event.x, y: event.y, heading: event.heading });
+      }
       setTrackingState(event.trackingState);
     });
     return () => {

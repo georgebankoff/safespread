@@ -1,17 +1,38 @@
 export type TrackingState = 'normal' | 'limited' | 'notAvailable';
+export type TrackingReason =
+  | 'none'
+  | 'initializing'
+  | 'excessiveMotion'
+  | 'insufficientFeatures'
+  | 'relocalizing'
+  | 'interrupted'
+  | 'sessionFailed'
+  | 'unknown';
+export type MappingStatus = 'notAvailable' | 'limited' | 'extending' | 'mapped' | 'unknown';
 
 /**
  * Whether a pose is trustworthy enough to drive the rover from.
- * `limited` still yields usable ARKit poses (it is the normal state while
- * indoors or shortly after start), so only `notAvailable` withholds data.
+ * Autonomous motion requires ARKit's strongest tracking state. A limited pose
+ * remains useful for UI diagnostics but is never eligible to drive the rover.
  */
 export function isPoseUsable(state: TrackingState): boolean {
-  return state !== 'notAvailable';
+  return state === 'normal';
 }
 
-export type PoseUpdatePayload = {
+type TrackingMetadata = {
+  frameTimestampMs: number;
+  sequence: number;
+  trackingState: TrackingState;
+  trackingReason: TrackingReason;
+  mappingStatus: MappingStatus;
+};
+
+export type PoseUpdatePayload = TrackingMetadata & {
+  kind: 'pose';
   x: number;
   y: number;
   heading: number;
-  trackingState: TrackingState;
+} | TrackingMetadata & {
+  kind: 'status';
+  error?: string;
 };
