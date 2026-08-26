@@ -30,8 +30,6 @@ smartphone mounted on the rover.
 
 ## Non-goals
 
-- Supporting Android in this pass (phone in hand is an iPhone; Android
-  ARCore support is a possible future extension, not part of this design).
 - Multi-session mapping / persistent world anchors across runs.
 - Handling arbitrary field shapes — square coverage only, matching current
   scope.
