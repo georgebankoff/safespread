@@ -49,6 +49,8 @@ float fieldPassFt  = 21.91f;
 float fieldWidthFt = 21.91f;
 const unsigned long VIO_TIMEOUT_MS = 1000;
 
+const int MAX_LANES = 64;
+bool laneCovered[MAX_LANES];
 int totalLanes  = 0;
 int currentLane = 0;
 
@@ -124,22 +126,24 @@ volatile bool bleConnected = false;
 enum AutoState {
   AUTO_IDLE,
   AUTO_PASS,        // straight run along a lane; the only state that sprays
-  AUTO_TURN_FWD,    // forward, full lock: first ~90 deg of the 180
-  AUTO_TURN_REV,    // reverse, opposite lock: remaining ~90 deg
-  AUTO_TURN_ALIGN,  // creep onto the new lane before spraying again
+  AUTO_TURN,        // full-lock 180 arc in the headland
+  AUTO_TURN_ALIGN,  // settle onto the chosen lane before spraying again
   AUTO_COMPLETE
 };
 AutoState state = AUTO_IDLE;
 
 inline bool isNavigating() {
-  return state == AUTO_PASS || state == AUTO_TURN_FWD ||
-         state == AUTO_TURN_REV || state == AUTO_TURN_ALIGN;
+  return state == AUTO_PASS || state == AUTO_TURN || state == AUTO_TURN_ALIGN;
 }
 
-// Even lanes run "up" (+Y, heading 0), odd lanes run back "down" (heading 180).
-inline bool laneGoesUp(int lane)     { return (lane % 2) == 0; }
-inline float laneTargetY(int lane)   { return laneGoesUp(lane) ? fieldPassFt : 0.0f; }
-inline float laneDesiredHeading(int lane) { return laneGoesUp(lane) ? 0.0f : 180.0f; }
+// Lanes are no longer driven in index order: a full-lock 180 shifts sideways
+// by the turning diameter, which is many lane widths, so after each turn we
+// take whichever uncovered lane we actually ended up nearest. Direction of
+// travel therefore depends on which end of the lane we start from, not on
+// whether the lane index is odd or even.
+bool passGoesUp = true;
+inline float passTargetY()      { return passGoesUp ? fieldPassFt : 0.0f; }
+inline float passDesiredHeading(){ return passGoesUp ? 0.0f : 180.0f; }
 
 void setChannelPulse(uint8_t channel, int microseconds) {
   uint16_t ticks = (uint16_t)(((uint32_t)microseconds * 4096UL) / 20000UL);
@@ -182,7 +186,9 @@ void bleLog(String msg) {
 
 void regenerateLanes() {
   totalLanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  if (totalLanes > MAX_LANES) totalLanes = MAX_LANES;
   currentLane = 0;
+  for (int i = 0; i < MAX_LANES; i++) laneCovered[i] = false;
   float covered = laneCenterX(totalLanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
                   BAR_WIDTH_FT * 0.5f;
   bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
@@ -267,40 +273,60 @@ bool insideField() {
          robotX_ft >= -0.5f && robotX_ft <= fieldWidthFt + 0.5f;
 }
 
+int nearestUncoveredLane() {
+  int best = -1;
+  float bestDist = 1e9f;
+  for (int i = 0; i < totalLanes; i++) {
+    if (laneCovered[i]) continue;
+    float d = fabsf(laneCenterX(i, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best;
+}
+
+int lanesRemaining() {
+  int n = 0;
+  for (int i = 0; i < totalLanes; i++) if (!laneCovered[i]) n++;
+  return n;
+}
+
 void beginPass(int lane) {
   currentLane = lane;
+  // Run whichever way needs less backtracking from where the turn left us.
+  passGoesUp = (robotY_ft < fieldPassFt * 0.5f);
   phaseStart = millis();
   resetCourse();
   state = AUTO_PASS;
-  bleLog(">>> Pass " + String(lane + 1) + "/" + String(totalLanes) + " at x=" +
-         String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) + " ft");
+  bleLog(">>> Lane " + String(lane + 1) + " (x=" +
+         String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) + " ft, " +
+         String(passGoesUp ? "up" : "down") + "), " +
+         String(lanesRemaining()) + " left");
 }
 
 void beginTurn() {
   setSpray(false);
   turnStartHeading = robotHeading;
   phaseStart = millis();
-  state = AUTO_TURN_FWD;
-  bleLog(">>> Turning to lane " + String(currentLane + 2) + "/" + String(totalLanes));
+  state = AUTO_TURN;
 }
 
 void runPass() {
   float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
-  bool goingUp = laneGoesUp(currentLane);
-  float targetY = laneTargetY(currentLane);
-
-  holdLane(laneX, laneDesiredHeading(currentLane), goingUp);
+  holdLane(laneX, passDesiredHeading(), passGoesUp);
   setChannelPulse(ESC_CH, THROTTLE_FWD_US);
 
   // Spray only on the straight run and only over the rectangle itself, so the
   // path may overrun the ends but the wetted area stays a clean rectangle.
   setSpray(insideField());
 
-  bool reached = goingUp ? (robotY_ft >= targetY - PASS_END_TOL_FT)
-                         : (robotY_ft <= targetY + PASS_END_TOL_FT);
+  float targetY = passTargetY();
+  bool reached = passGoesUp ? (robotY_ft >= targetY - PASS_END_TOL_FT)
+                            : (robotY_ft <= targetY + PASS_END_TOL_FT);
   if (reached) {
     setSpray(false);
-    if (currentLane + 1 >= totalLanes) {
+    laneCovered[currentLane] = true;
+
+    if (lanesRemaining() == 0) {
       stopDrive();
       state = AUTO_COMPLETE;
       bleLog("=== MISSION COMPLETE: " + String(totalLanes) + " lanes ===");
@@ -310,51 +336,71 @@ void runPass() {
   }
 }
 
-// The 180 is split so a car with a turning circle far wider than one lane can
-// still line up on the next lane: swing out forward, then back up around.
+// One full-lock 180. It displaces sideways by the turning diameter, which is
+// several lane widths, so rather than fight that we let it land where it
+// lands and then take the nearest lane still to be done -- which bounds the
+// remaining cross-track error at half a lane spacing regardless of how wide
+// the rover actually turns.
 void runTurn() {
-  // Even lanes head up (+Y) with the next lane to the right; odd lanes head
-  // down, putting the next lane to their left.
-  bool turnRight = laneGoesUp(currentLane);
-  float turned = fabsf(angleDiffDeg(robotHeading, turnStartHeading));
   bool timedOut = (millis() - phaseStart > TURN_PHASE_TIMEOUT_MS);
 
-  if (state == AUTO_TURN_FWD) {
+  if (state == AUTO_TURN) {
+    // Turn toward whichever side still has work, so the sweep is not wasted.
+    bool workToPositiveX = false;
+    for (int i = 0; i < totalLanes; i++) {
+      if (!laneCovered[i] &&
+          laneCenterX(i, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) > robotX_ft) {
+        workToPositiveX = true;
+        break;
+      }
+    }
+    // Heading up, +X is to the rover's right; heading down it is to its left.
+    bool turnRight = passGoesUp ? workToPositiveX : !workToPositiveX;
+
     steerRightward(turnRight ? MAX_STEER_OFFSET : -MAX_STEER_OFFSET);
     setChannelPulse(ESC_CH, THROTTLE_TURN_US);
-    if (turned >= 90.0f || timedOut) {
-      stopDrive();
-      phaseStart = millis();
-      state = AUTO_TURN_REV;
-    }
-    return;
-  }
 
-  if (state == AUTO_TURN_REV) {
-    // Reversing with opposite lock keeps rotating the same way round.
-    steerRightward(turnRight ? -MAX_STEER_OFFSET : MAX_STEER_OFFSET);
-    setChannelPulse(ESC_CH, THROTTLE_REV_US);
-    if (turned >= 165.0f || timedOut) {
-      stopDrive();
+    float turned = fabsf(angleDiffDeg(robotHeading, turnStartHeading));
+    if (turned >= 170.0f || timedOut) {
+      int lane = nearestUncoveredLane();
+      if (lane < 0) {
+        stopDrive();
+        state = AUTO_COMPLETE;
+        bleLog("=== MISSION COMPLETE ===");
+        return;
+      }
+      currentLane = lane;
+      passGoesUp = (robotY_ft < fieldPassFt * 0.5f);
       phaseStart = millis();
-      resetCourse();  // course ran backwards through the reverse leg
+      resetCourse();
       state = AUTO_TURN_ALIGN;
+      bleLog(">>> Aiming lane " + String(lane + 1) + " (x=" +
+             String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) +
+             ", off by " +
+             String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft, 2) +
+             " ft)");
     }
     return;
   }
 
-  // AUTO_TURN_ALIGN: creep forward onto the new lane before committing.
-  int nextLane = currentLane + 1;
-  float laneX = laneCenterX(nextLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
-  float desired = laneDesiredHeading(nextLane);
-  holdLane(laneX, desired, laneGoesUp(nextLane));
+  // AUTO_TURN_ALIGN: settle onto the chosen lane out in the headland, before
+  // re-entering the rectangle, so the pass starts already on line.
+  float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  float desired = passDesiredHeading();
+  holdLane(laneX, desired, passGoesUp);
   setChannelPulse(ESC_CH, THROTTLE_TURN_US);
 
+  float reference = courseValid ? courseDeg : robotHeading;
   bool onLine = fabsf(laneX - robotX_ft) < ALIGN_TOL_FT;
-  bool onHeading = fabsf(angleDiffDeg(desired, robotHeading)) < ALIGN_HEADING_TOL;
-  if ((onLine && onHeading) || timedOut) {
+  bool onHeading = fabsf(angleDiffDeg(desired, reference)) < ALIGN_HEADING_TOL;
+
+  // Do not keep aligning once the rectangle has been re-entered, or the top
+  // of the lane goes unsprayed while the rover is still converging.
+  bool enteringField = passGoesUp ? (robotY_ft > 0.0f) : (robotY_ft < fieldPassFt);
+
+  if ((onLine && onHeading) || enteringField || timedOut) {
     if (timedOut) bleLog("!! Align timed out; starting pass anyway.");
-    beginPass(nextLane);
+    beginPass(currentLane);
   }
 }
 
@@ -535,8 +581,7 @@ void loop() {
     lastTelemetryTime = millis();
     String phase = "IDLE";
     if (state == AUTO_PASS)            phase = "RUN";
-    else if (state == AUTO_TURN_FWD)   phase = "TURN1";
-    else if (state == AUTO_TURN_REV)   phase = "TURN2";
+    else if (state == AUTO_TURN)       phase = "TURN";
     else if (state == AUTO_TURN_ALIGN) phase = "ALIGN";
     else if (state == AUTO_COMPLETE)   phase = "DONE";
 
