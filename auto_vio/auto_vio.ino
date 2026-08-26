@@ -23,6 +23,7 @@
 #include <math.h>
 #include "nav_math.h"
 #include "route.h"
+#include "steering.h"
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -65,6 +66,33 @@ const unsigned long VIO_TIMEOUT_MS = 1000;
 // turn_radius/turn_radius.ino, press Start, and copy the two numbers here.
 float turnRadiusLeftFt  = 4.33f;
 float turnRadiusRightFt = 2.92f;
+
+// The pulse at which the wheels actually point straight ahead. It is NOT the
+// midpoint of the servo's travel, and assuming it was is what made every
+// outbound pass sit off to one side and every return pass off to the other --
+// which shows up as pairs of overlapping lines with gaps between them, not as
+// obvious drift.
+//
+// The measured circles say where the true centre is. Steering angle grows
+// roughly with distance from it, and turning radius goes as the reciprocal of
+// the angle, so
+//     (LEFT_US - c) / (c - RIGHT_US) = rRight / rLeft
+// With 4.33 ft left and 2.92 ft right that puts c near 1709us, not 1500: the
+// wheels have been sitting about a fifth of full lock to the right whenever
+// the code believed they were straight.
+// The arithmetic lives in steering.h so it can be tested on a host against a
+// simulated rover whose real centre is known.
+float steerTrimUs = 0.0f;               // learned on top of the computed centre
+const float STEER_TRIM_LIMIT_US = 250.0f;
+const float STEER_TRIM_RATE     = 0.05f;
+const float STEER_TRIM_NEAR_FT  = 0.4f; // only learn while actually on the line
+int  lastSteerCommandUs = 1500;
+unsigned long lastTrimUpdate = 0;
+
+float steerCentreUs() {
+  return steeringCentreUs(turnRadiusLeftFt, turnRadiusRightFt,
+                          STEER_LEFT_US, STEER_RIGHT_US) + steerTrimUs;
+}
 
 // Steering polarity: +1 means a pulse BELOW centre steers toward increasing
 // heading (clockwise / to the rover's right), matching STEER_RIGHT_US < centre.
@@ -275,7 +303,7 @@ void setSpray(bool on) {
 
 void stopDrive() {
   setChannelPulse(ESC_CH, NEUTRAL_US);
-  setChannelPulse(STEER_CH, STEER_CENTER_US);
+  setChannelPulse(STEER_CH, (int)steerCentreUs());
 }
 
 void announceArea() {
@@ -341,8 +369,13 @@ void runSelfTest() {
   setChannelPulse(STEER_CH, STEER_RIGHT_US);
   delay(1000);
 
-  bleLog("[INFO] Steering CENTER (" + String(STEER_CENTER_US) + "us)...");
-  setChannelPulse(STEER_CH, STEER_CENTER_US);
+  // Centre is where the wheels really point straight, computed from the two
+  // measured circles -- not the middle of the servo's travel. Look along the
+  // rover here: the front wheels should be dead straight. If they are not,
+  // re-measure the turning radii, because everything else is built on them.
+  bleLog("[INFO] Steering CENTER (" + String((int)steerCentreUs()) +
+         "us, servo mid is " + String(STEER_CENTER_US) + ")...");
+  setChannelPulse(STEER_CH, (int)steerCentreUs());
   delay(500);
 
   bleLog("[INFO] Valve ON 1s...");
@@ -356,11 +389,34 @@ void runSelfTest() {
   bleLog("=== SELF TEST COMPLETE ===");
 }
 
-// `rightward` > 0 steers toward increasing heading (rover's right).
+// `rightward` > 0 steers toward increasing heading (rover's right), with
+// MAX_STEER_OFFSET meaning full lock. Each side is scaled by its own travel
+// from the true centre, which is not the same on both sides, so an equal
+// command gives an equal fraction of the available turn whichever way it goes.
 void steerRightward(float rightward) {
-  rightward = constrain(rightward, -MAX_STEER_OFFSET, MAX_STEER_OFFSET);
-  int us = STEER_CENTER_US - (int)(steerSign * rightward);
-  setChannelPulse(STEER_CH, constrain(us, STEER_RIGHT_US, STEER_LEFT_US));
+  if (steerSign < 0) rightward = -rightward;
+
+  float us = steerPulseUs(rightward, steerCentreUs(),
+                          STEER_LEFT_US, STEER_RIGHT_US, MAX_STEER_OFFSET);
+
+  lastSteerCommandUs = (int)us;
+  setChannelPulse(STEER_CH, (int)us);
+}
+
+// On a straight pass the steering has to average out to whatever pulse really
+// does point the wheels straight -- so the average of what we apply IS the
+// true centre, and we can just learn it. This catches whatever the measured
+// radii did not: a servo that has crept, tyre pull, a cambered lawn. Only
+// learn while the rover is already close to its line, or the correction it is
+// making to get back on would be mistaken for the bias.
+void learnSteeringTrim(float offPlanFt) {
+  if (offPlanFt > STEER_TRIM_NEAR_FT) return;
+  if (millis() - lastTrimUpdate < 50) return;
+  lastTrimUpdate = millis();
+
+  steerTrimUs = updateSteeringTrim(steerTrimUs, (float)lastSteerCommandUs,
+                                   steerCentreUs(), STEER_TRIM_RATE,
+                                   STEER_TRIM_LIMIT_US);
 }
 
 void planRoute() {
@@ -395,7 +451,8 @@ void planRoute() {
   bleLog("Planned " + String(routeCount) + " pts, " + String(lanes) +
          " lanes, " + String(reversals) + " direction changes.");
   bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
-         String(turnRadiusRightFt, 2) + " ft.");
+         String(turnRadiusRightFt, 2) + " ft, straight-ahead at " +
+         String((int)steerCentreUs()) + "us.");
   bleLog("Needs clear ground " + String(maxY - fieldPassFt, 1) + " ft past the far end, " +
          String(-minY, 1) + " ft behind the start.");
 
@@ -496,6 +553,14 @@ void runFollow() {
   if (!reversing) {
     observeSteeringPolarity();
     polarityLastCommand = command;
+
+    // Learn the true steering centre on the straight passes, where "straight
+    // ahead" is a fact we can check against rather than a guess.
+    if (!route[routeIndex].turning) {
+      float ox = route[routeIndex].x - robotX_ft;
+      float oy = route[routeIndex].y - robotY_ft;
+      learnSteeringTrim(sqrtf(ox * ox + oy * oy));
+    }
   } else {
     polarityLastHeading = robotHeading;   // don't let a reverse leg pollute it
   }
@@ -708,6 +773,7 @@ void loop() {
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " hdg=" + String(robotHeading, 0) +
            " pt=" + String(routeIndex) + "/" + String(routeCount) +
+           " ctr=" + String((int)steerCentreUs()) +
            (dryRunMode ? " DRY" : " WET") +
            (sprayActive ? " spray=ON" : " spray=OFF") +
            (pwmRecoveries ? " pwmfix=" + String(pwmRecoveries) : ""));
