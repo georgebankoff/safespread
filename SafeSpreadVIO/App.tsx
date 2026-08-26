@@ -9,8 +9,11 @@ import {
   View,
 } from 'react-native';
 import { useKeepAwake } from 'expo-keep-awake';
+import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
+import PathMap from './src/PathMap';
+import { PathPoint, MAX_PATH_POINTS, shouldRecord } from './src/pathMath';
 
 const ble = new SafeSpreadBLE();
 
@@ -20,6 +23,10 @@ export default function App() {
   useKeepAwake();
 
   const { pose, trackingState, trackingOk, zero } = useVIOPose();
+
+  // In dry mode nothing is dispensed, so the beep is the only audible cue that
+  // the rover thinks it is spraying -- useful when it is across the yard.
+  const beep = useAudioPlayer(require('./assets/spray-beep.wav'));
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [nText, setNText] = useState('21.9');
   const [mText, setMText] = useState('21.9');
@@ -30,6 +37,9 @@ export default function App() {
   const [spraying, setSpraying] = useState(false);
   const [running, setRunning] = useState(false);
   const [sentCount, setSentCount] = useState(0);
+  const [path, setPath] = useState<PathPoint[]>([]);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [mapDims, setMapDims] = useState({ n: 21.9, m: 21.9 });
   const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
@@ -43,6 +53,22 @@ export default function App() {
     ble.sendArea(n, m);
     setAreaNote(`Sent ${n} × ${m} ft (${Math.round(n * m)} sqft)`);
   };
+
+  // Keep beeping even with the ringer switch flipped to silent, which is where
+  // a phone strapped to a rover usually lives.
+  useEffect(() => {
+    setAudioModeAsync({ playsInSilentMode: true }).catch(() => {});
+    beep.loop = true;
+  }, []);
+
+  useEffect(() => {
+    if (dryRun && spraying) {
+      beep.seekTo(0);
+      beep.play();
+    } else {
+      beep.pause();
+    }
+  }, [dryRun, spraying]);
 
   useEffect(() => {
     const handleLog = (line: string) => {
@@ -72,8 +98,8 @@ export default function App() {
   // Read through refs, and depend on nothing: `pose` is a fresh object every
   // ARKit frame (~60Hz), so listing it here would clear and recreate the
   // interval every ~16ms and the 100ms tick would never once fire.
-  const sendStateRef = useRef({ pose, status, trackingOk });
-  sendStateRef.current = { pose, status, trackingOk };
+  const sendStateRef = useRef({ pose, status, trackingOk, spraying, running });
+  sendStateRef.current = { pose, status, trackingOk, spraying, running };
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -81,6 +107,21 @@ export default function App() {
       if (current.status === 'connected' && current.trackingOk) {
         ble.sendPose(current.pose.x, current.pose.y, current.pose.heading);
         setSentCount((n) => n + 1);
+      }
+
+      // Trace the mission, including the headland turns, so the map shows the
+      // real path and not just the sprayed parts.
+      if (current.running) {
+        const next: PathPoint = {
+          x: current.pose.x,
+          y: current.pose.y,
+          spraying: current.spraying,
+        };
+        setPath((prev) =>
+          shouldRecord(prev[prev.length - 1], next)
+            ? [...prev.slice(-(MAX_PATH_POINTS - 1)), next]
+            : prev
+        );
       }
     }, 100);
     return () => clearInterval(timer);
@@ -173,6 +214,10 @@ export default function App() {
             // Zeroing the origin must not happen unless the rover will
             // actually restart from it.
             zero();
+            // The old trace belongs to the old origin; keep the dimensions the
+            // run actually used so the map matches what was driven.
+            setPath([]);
+            setMapDims({ n: parseFloat(nText) || 0, m: parseFloat(mText) || 0 });
             ble.sendCommand('1');
           }}
         >
@@ -190,7 +235,21 @@ export default function App() {
         >
           <Text style={styles.buttonText}>Self Test</Text>
         </Pressable>
+        <Pressable
+          style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}
+          onPress={() => setMapOpen(true)}
+        >
+          <Text style={styles.buttonText}>Map</Text>
+        </Pressable>
       </View>
+
+      <PathMap
+        visible={mapOpen}
+        onClose={() => setMapOpen(false)}
+        widthFt={mapDims.m}
+        lengthFt={mapDims.n}
+        points={path}
+      />
     </View>
   );
 }
@@ -270,6 +329,13 @@ const styles = StyleSheet.create({
   testButton: {
     flex: 1,
     backgroundColor: '#1565c0',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  mapButton: {
+    flex: 1,
+    backgroundColor: '#455a64',
     paddingVertical: 14,
     borderRadius: 8,
     alignItems: 'center',
