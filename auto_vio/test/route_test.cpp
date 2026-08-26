@@ -95,6 +95,52 @@ int main() {
     printf("route_test: 10x10 -> %d points, %d lanes\n", n, totalLanes);
   }
 
+  // --- following the route -----------------------------------------------
+  // Drive a simulated Ackermann rover along the plan and require it to stay on
+  // it. This is the part that used to fail on grass with no way to see why.
+  {
+    static RoutePoint pts[4000];
+    int n = buildRoute(21.91f, 21.91f, BAR, OVERLAP, R, pts, 4000);
+
+    float x = pts[0].x, y = pts[0].y, heading = 0.0f;  // 0 = +Y, clockwise
+    const float STEP = 0.15f;      // ft travelled per tick
+    const float LOOKAHEAD = 2.5f;
+    int idx = 0;
+    float worstOffLine = 0.0f;
+    int ticks = 0;
+
+    while (idx < n - 1 && ticks < 40000) {
+      idx = nearestRouteIndex(pts, n, idx, x, y, 80);
+      int la = lookaheadRouteIndex(pts, n, idx, x, y, LOOKAHEAD);
+
+      float dx = pts[la].x - x;
+      float dy = pts[la].y - y;
+      float want = bearingToWaypointDeg(dx, dy);
+      float err = angleDiffDeg(want, heading);
+
+      // A real rover cannot turn tighter than its radius: cap the rate.
+      float maxTurnDeg = (STEP / R) * 180.0f / (float)M_PI;
+      float turn = err;
+      if (turn > maxTurnDeg) turn = maxTurnDeg;
+      if (turn < -maxTurnDeg) turn = -maxTurnDeg;
+
+      heading = fmodf(heading + turn + 360.0f, 360.0f);
+      float rad = heading * (float)M_PI / 180.0f;
+      x += STEP * sinf(rad);
+      y += STEP * cosf(rad);
+
+      float offX = pts[idx].x - x, offY = pts[idx].y - y;
+      float off = sqrtf(offX * offX + offY * offY);
+      if (off > worstOffLine) worstOffLine = off;
+      ticks++;
+    }
+
+    assert(idx >= n - 2);                 // reached the end of the plan
+    assert(worstOffLine < 1.5f);          // never wandered far from it
+    printf("route_test: simulated follow finished in %d ticks, worst %.2f ft off\n",
+           ticks, worstOffLine);
+  }
+
   printf("route_test: all assertions passed\n");
   return 0;
 }
