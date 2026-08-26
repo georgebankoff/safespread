@@ -23,6 +23,7 @@ export default function App() {
   const [log, setLog] = useState<string[]>([]);
   const [dryRun, setDryRun] = useState(false);
   const [spraying, setSpraying] = useState(false);
+  const [running, setRunning] = useState(false);
   const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
@@ -42,7 +43,9 @@ export default function App() {
       // Telemetry is a once-per-second heartbeat; pin it rather than letting
       // it scroll the interesting mission messages away.
       if (line.startsWith('[TLM]')) {
-        setTelemetry(line.slice(5).trim());
+        const body = line.slice(5).trim();
+        setTelemetry(body);
+        setRunning(body.startsWith('RUN'));
       } else if (line === '[SPRAY] ON' || line === '[SPRAY] OFF') {
         setSpraying(line.endsWith('ON'));
       } else if (line === '[MODE] DRY' || line === '[MODE] WET') {
@@ -140,13 +143,20 @@ export default function App() {
       </View>
       <View style={styles.buttons}>
         <Pressable
-          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+          disabled={running}
+          style={({ pressed }) => [
+            styles.button,
+            running && styles.disabled,
+            pressed && styles.pressed,
+          ]}
           onPress={() => {
+            // Zeroing the origin must not happen unless the rover will
+            // actually restart from it.
             zero();
             ble.sendCommand('1');
           }}
         >
-          <Text style={styles.buttonText}>Start / Reset</Text>
+          <Text style={styles.buttonText}>{running ? 'Running…' : 'Start / Reset'}</Text>
         </Pressable>
         <Pressable
           style={({ pressed }) => [styles.button, pressed && styles.pressed]}
@@ -171,6 +181,7 @@ const styles = StyleSheet.create({
   hud: { position: 'absolute', top: 60, left: 20 },
   // Pressed feedback: buttons dim while a finger is down.
   pressed: { opacity: 0.6 },
+  disabled: { backgroundColor: '#444' },
   areaPanel: {
     position: 'absolute',
     top: 200,

@@ -225,11 +225,18 @@ static size_t  accLen = 0;
 
 void feed(const uint8_t *d, size_t n) {
   if (n == 1) {
-    if (d[0] == '1' && state == AUTO_IDLE) {
-      state = AUTO_NAVIGATING;
-      currentWaypointIndex = 0;
-      setSpray(true);
-      bleLog(">>> Mission started. " + String(waypointCount) + " waypoints.");
+    if (d[0] == '1') {
+      // Refused while running: the app re-zeros its VIO origin when Start is
+      // pressed, so accepting a restart mid-drive would leave the rover
+      // navigating old waypoints in a newly-shifted coordinate frame.
+      if (state == AUTO_NAVIGATING) {
+        bleLog("!! Already running. Press Stop first.");
+      } else {
+        state = AUTO_NAVIGATING;
+        currentWaypointIndex = 0;
+        setSpray(true);
+        bleLog(">>> Mission started. " + String(waypointCount) + " waypoints.");
+      }
     } else if (d[0] == '2') {
       state = AUTO_IDLE;
       stopDrive();
