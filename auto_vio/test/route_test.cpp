@@ -217,6 +217,27 @@ int main() {
     printf("route_test: 10x10 -> %d points, %d lanes\n", sn, sl);
   }
 
+  // --- a one-lane area is a straight-line test ----------------------------
+  // Setting the width to less than one bar gives a single pass and nothing
+  // else, which isolates the tracker: no turns, no lane stepping, just "can
+  // this rover hold a line". Worth guaranteeing, since it is the first thing
+  // to check when coverage looks wrong.
+  {
+    static RoutePoint line[6000];
+    int ln = buildRoute(20.0f, 1.0f, BAR, OVERLAP, RL, RR, line, 6000);
+    assert(laneCount(1.0f, BAR, OVERLAP) == 1);
+    assert(ln > 10);
+    for (int i = 0; i < ln; i++) {
+      assert(line[i].spray);            // sprays the whole way
+      assert(!line[i].reverse);         // never backs up
+      assert(!line[i].turning);         // and never turns
+      assert(fabsf(line[i].x) < 0.01f); // dead straight along x=0
+    }
+    assert(fabsf(line[0].y) < 0.01f);
+    assert(fabsf(line[ln - 1].y - 20.0f) < 0.01f);
+    printf("route_test: 20x1 -> %d points, one straight sprayed pass\n", ln);
+  }
+
   // --- following the route, reversing included ----------------------------
   simulateFollow(FIELD, "real field");
   simulateFollow(10.0f, "10x10");
