@@ -60,6 +60,8 @@ bool  vioActive    = false;
 unsigned long lastVioTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long packetCount = 0;
+bool dryRunMode  = false;
+bool sprayActive = false;
 
 Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
 BLECharacteristic *txCharacteristic = NULL;
@@ -73,9 +75,22 @@ void setChannelPulse(uint8_t channel, int microseconds) {
   pwm.setPWM(channel, 0, ticks);
 }
 
+// In dry-run mode the spray state is still tracked and reported so the app
+// can show where it *would* have sprayed, but no hardware is energised.
 void setSpray(bool on) {
+  if (sprayActive != on) {
+    sprayActive = on;
+    bleLog(on ? "[SPRAY] ON" : "[SPRAY] OFF");
+  }
+
+  if (dryRunMode) {
+    digitalWrite(VALVE_PIN, LOW);
+    digitalWrite(PUMP_PIN, LOW);
+    return;
+  }
+
   digitalWrite(VALVE_PIN, on ? HIGH : LOW);
-  digitalWrite(PUMP_PIN, LOW);
+  digitalWrite(PUMP_PIN, on ? HIGH : LOW);
 }
 
 void stopDrive() {
@@ -227,6 +242,14 @@ void feed(const uint8_t *d, size_t n) {
         runSelfTest();
         stopDrive();
       }
+    } else if (d[0] == '4') {
+      if (state == AUTO_NAVIGATING) {
+        bleLog("!! Mode change refused: stop the mission first.");
+      } else {
+        dryRunMode = !dryRunMode;
+        setSpray(false);  // never leave hardware energised across a mode change
+        bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
+      }
     }
     return;
   }
@@ -284,6 +307,9 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) {
     bleConnected = true;
     bleLog("VIO app connected.");
+    // Re-announce state so a freshly connected app isn't showing stale UI.
+    bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
+    bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
   }
   void onDisconnect(BLEServer *s) {
     bleConnected = false;
@@ -346,7 +372,9 @@ void loop() {
            " pkts=" + String(packetCount) +
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " hdg=" + String(robotHeading, 0) +
-           " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount));
+           " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount) +
+           (dryRunMode ? " DRY" : " WET") +
+           (sprayActive ? " spray=ON" : " spray=OFF"));
   }
 
   if (vioActive && (millis() - lastVioTime > VIO_TIMEOUT_MS)) {
