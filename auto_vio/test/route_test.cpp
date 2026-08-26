@@ -12,12 +12,27 @@ static const float RR = 2.92f;
 static RoutePoint pts[6000];
 static RoutePoint sim[6000];
 
+static const float MAX_OFFSET   = 700.0f;
+static const float PURSUIT_GAIN = 16.0f;
+
+/** The curvature the rover actually ends up with for a given steering command,
+ *  including saturation at each side's own lock. Modelling this rather than
+ *  "turn as hard as needed" is what makes the simulation say the same thing
+ *  the firmware will do -- an optimistic steering model here was reporting
+ *  tracking a third better than the real law achieves. */
+static float appliedKappa(float commandUs) {
+  if (commandUs > MAX_OFFSET)  commandUs = MAX_OFFSET;
+  if (commandUs < -MAX_OFFSET) commandUs = -MAX_OFFSET;
+  float kMax = (commandUs >= 0.0f) ? 1.0f / RR : 1.0f / RL;
+  return (commandUs / MAX_OFFSET) * kMax;
+}
+
 // Drive a simulated Ackermann rover, with the rover's real asymmetric radii,
 // along the whole plan -- reversing legs included. This is the part that used
 // to fail on grass with no way to see why.
 static void simulateFollow(float field, const char *label) {
   const float STEP           = 0.15f;   // ft per tick
-  const float LOOKAHEAD      = 2.5f;    // straight passes
+  const float LINE_T         = 1.5f;    // straight-run convergence constant
   const float LOOKAHEAD_TURN = 1.0f;    // shorter than the tightest radius
   const float CUSP_TOL       = 0.5f;
   const int   WINDOW         = 80;
@@ -44,22 +59,26 @@ static void simulateFollow(float field, const char *label) {
     assert(stuck < 400);            // never wedged against a cusp
 
     bool rev = sim[idx].reverse;
-    int la = lookaheadWithinSegment(sim, n, idx, x, y,
-                                    sim[idx].turning ? LOOKAHEAD_TURN : LOOKAHEAD);
-
-    float want = bearingToWaypointDeg(sim[la].x - x, sim[la].y - y);
     float reference = rev ? fmodf(heading + 180.0f, 360.0f) : heading;
-    float err = angleDiffDeg(want, reference);
+    float command, crossNow = 0.0f;
 
-    // Which circle the rover is on depends on which way the wheels go, and
-    // reversing swaps that: backing up, the nose swings the other way.
-    float R = rev ? ((err > 0.0f) ? RL : RR) : ((err > 0.0f) ? RR : RL);
+    if (sim[idx].turning) {
+      int la = lookaheadWithinSegment(sim, n, idx, x, y, LOOKAHEAD_TURN);
+      float want = bearingToWaypointDeg(sim[la].x - x, sim[la].y - y);
+      command = angleDiffDeg(want, reference) * PURSUIT_GAIN;
+    } else {
+      // The same law the firmware uses on straight runs.
+      float lineHeading = segmentHeadingDeg(sim, n, idx);
+      crossNow = crossTrackFt(sim[idx].x, sim[idx].y, lineHeading, x, y);
+      float headingErr = angleDiffDeg(lineHeading, reference);
+      command = curvatureToCommand(lineFollowCurvature(crossNow, headingErr, LINE_T),
+                                   RL, RR, MAX_OFFSET);
+    }
 
-    float maxTurn = (STEP / R) * 180.0f / (float)M_PI;
-    float turn = err;
-    if (turn > maxTurn) turn = maxTurn;
-    if (turn < -maxTurn) turn = -maxTurn;
-
+    // Both driving forward and backing up, the travel direction turns the same
+    // way for a given command: the firmware mirrors the steering in reverse and
+    // the physics mirrors it back.
+    float turn = appliedKappa(command) * STEP * 180.0f / (float)M_PI;
     heading = fmodf(heading + turn + 360.0f, 360.0f);
     float rad = heading * (float)M_PI / 180.0f;
     float sgn = rev ? -1.0f : 1.0f;
@@ -69,7 +88,12 @@ static void simulateFollow(float field, const char *label) {
     float offX = sim[idx].x - x, offY = sim[idx].y - y;
     float off = sqrtf(offX * offX + offY * offY);
     if (off > worstOff) worstOff = off;
-    if (!sim[idx].turning && off > worstStraight) worstStraight = off;
+
+    // Sideways error while actually spraying is what decides whether the
+    // strips land side by side or on top of each other.
+    if (sim[idx].spray && fabsf(crossNow) > worstStraight) {
+      worstStraight = fabsf(crossNow);
+    }
 
     float limit = (idx < firstPassEnd) ? SPRAY_OFF_1ST : SPRAY_OFF;
     bool spraying = sim[idx].spray && off <= limit;
@@ -86,15 +110,16 @@ static void simulateFollow(float field, const char *label) {
   assert(worstOff < 1.5f);       // never wandered far from it
   assert(!firstPassGap);         // first pass sprayed end to end
 
-  // Entering each pass, the rover must be inside a lane width of the line, or
-  // it sprays the wrong strip.
-  assert(worstStraight < laneSpacing(BAR, OVERLAP));
+  // While spraying, the rover must stay inside half a lane width of its line.
+  // Beyond that, neighbouring strips start landing on top of each other --
+  // which is what "it drives back over what it just covered" looks like.
+  assert(worstStraight < 0.5f * laneSpacing(BAR, OVERLAP));
 
   float wanted = lanes * field;
   assert(sprayedFt > 0.92f * wanted);
 
-  printf("route_test: %s follow -> %d ticks, worst %.2f ft off "
-         "(%.2f on passes), sprayed %.0f/%.0f ft\n",
+  printf("route_test: %s -> %d ticks, worst %.2f ft off plan, "
+         "%.2f ft sideways while spraying, sprayed %.0f/%.0f ft\n",
          label, ticks, worstOff, worstStraight, sprayedFt, wanted);
 }
 

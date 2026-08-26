@@ -92,6 +92,55 @@ inline int lookaheadRouteIndex(const PointT *route, int count, int fromIndex,
   return count - 1;
 }
 
+// --- Straight-line following ---------------------------------------------
+// Pure pursuit chases a point ahead of the rover, and chasing lags: it reaches
+// the line carrying heading error, crosses it, and comes back. On a pass that
+// is only a few lookaheads long the rover is still weaving when it gets to the
+// far end, which is why every pass except the first -- the only one that
+// starts on its line already aligned -- comes out curved.
+//
+// For a straight line there is a better law. Steer on how far off the line the
+// rover is and how far off parallel it is, in the ratio that makes the
+// approach critically damped, and it settles onto the line without ever
+// crossing it.
+//
+// Writing e for the sideways offset and s for distance travelled, a steered
+// vehicle obeys e'' = curvature, so commanding
+//     curvature = (2/T) * headingError - (1/T^2) * e
+// gives e'' + (2/T) e' + (1/T^2) e = 0: a critically damped approach with
+// distance constant T. T is in feet and sets how sharply it converges --
+// roughly 3*T feet to close a 1 ft error, with no overshoot at any T.
+
+/** Signed distance from the line through (lineX, lineY) heading lineHeadingDeg,
+ *  positive when the rover is off to the right of it. */
+inline float crossTrackFt(float lineX, float lineY, float lineHeadingDeg,
+                          float x, float y) {
+  float h = lineHeadingDeg * (float)M_PI / 180.0f;
+  float dx = sinf(h), dy = cosf(h);
+  return (x - lineX) * dy - (y - lineY) * dx;
+}
+
+/** Curvature (1/ft, positive turns right) that converges onto the line. */
+inline float lineFollowCurvature(float crossFt, float headingErrDeg,
+                                 float distanceConstantFt) {
+  float T = (distanceConstantFt > 0.1f) ? distanceConstantFt : 0.1f;
+  float psi = headingErrDeg * (float)M_PI / 180.0f;
+  return (2.0f / T) * psi - (1.0f / (T * T)) * crossFt;
+}
+
+/** Curvature as a steering command, scaled so `maxOffset` is full lock. Each
+ *  side is measured against its own tightest circle, so the command means the
+ *  same fraction of the turn available whichever way the rover is bending. */
+inline float curvatureToCommand(float kappa, float rLeftFt, float rRightFt,
+                                float maxOffset) {
+  float kMax = (kappa >= 0.0f) ? (1.0f / rRightFt) : (1.0f / rLeftFt);
+  if (!(kMax > 0.0f)) return 0.0f;
+  float cmd = maxOffset * (kappa / kMax);
+  if (cmd > maxOffset)  cmd = maxOffset;
+  if (cmd < -maxOffset) cmd = -maxOffset;
+  return cmd;
+}
+
 inline float angleDiffDeg(float target, float current) {
   float d = target - current;
   while (d > 180.0f) d -= 360.0f;
