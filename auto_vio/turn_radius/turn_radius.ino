@@ -32,7 +32,6 @@
 #include <math.h>
 #include "circle_fit.h"
 #include "measurement.h"
-#include "../throttle.h"
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -44,19 +43,8 @@ const uint8_t ESC_CH   = 4;
 
 // Matching auto_vio.ino. If they are changed there, change them here too --
 // a radius measured at a different steering angle describes a different rover.
-const int NEUTRAL_US = 1500;
-
-// Servoed to the same ground speed auto_vio.ino drives at. Turning radius
-// depends on speed, so a radius measured at some other speed is a number about
-// a different rover -- and a fixed pulse that turns an empty rover will not
-// turn a loaded one at all.
-const float TARGET_SPEED_FPS      = 1.8f;
-const float THROTTLE_MIN_OFFSET   = 70.0f;
-const float THROTTLE_MAX_OFFSET   = 400.0f;
-const float THROTTLE_START_OFFSET = 150.0f;
-const float THROTTLE_GAIN         = 15.0f;
-const unsigned long THROTTLE_UPDATE_MS = 200;
-const float SPEED_SMOOTHING       = 0.4f;
+const int NEUTRAL_US       = 1500;
+const int THROTTLE_TURN_US = 1600;
 
 const int STEER_CENTER_US  = 1500;
 const int STEER_LEFT_US    = 2390;
@@ -82,10 +70,6 @@ bool  vioActive    = false;
 unsigned long lastVioTime = 0;
 unsigned long packetCount = 0;
 
-float speedFps = 0.0f;
-float throttleOffsetUs = THROTTLE_START_OFFSET;
-float speedPrevX = 0.0f, speedPrevY = 0.0f;
-unsigned long speedPrevMs = 0;
 
 Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
 BLECharacteristic *txCharacteristic = NULL;
@@ -151,33 +135,6 @@ unsigned long phaseStart = 0;
 
 LegResult results[2];
 bool haveResults = false;
-
-void resetThrottle() {
-  throttleOffsetUs = THROTTLE_START_OFFSET;
-  speedFps = 0.0f;
-  speedPrevX = robotX_ft;
-  speedPrevY = robotY_ft;
-  speedPrevMs = millis();
-}
-
-// Wind the throttle to whatever actually delivers the target speed. Measuring
-// a turning circle at a speed the loaded rover cannot reach would describe a
-// rover that does not exist.
-void driveAtTargetSpeed() {
-  unsigned long now = millis();
-  if (now - speedPrevMs >= THROTTLE_UPDATE_MS) {
-    speedFps = updateSpeedFps(speedFps, robotX_ft - speedPrevX,
-                              robotY_ft - speedPrevY, now - speedPrevMs,
-                              SPEED_SMOOTHING);
-    speedPrevX = robotX_ft;
-    speedPrevY = robotY_ft;
-    speedPrevMs = now;
-    throttleOffsetUs = governThrottle(throttleOffsetUs, speedFps, TARGET_SPEED_FPS,
-                                      THROTTLE_GAIN, THROTTLE_MIN_OFFSET,
-                                      THROTTLE_MAX_OFFSET);
-  }
-  setChannelPulse(ESC_CH, NEUTRAL_US + (int)throttleOffsetUs);
-}
 
 void resetLegState() {
   sampleCount = 0;
@@ -472,10 +429,9 @@ void loop() {
     case P_SETTLE:
       // Hold full lock with the wheels turning slowly before recording, so the
       // arc that gets fitted is a steady-state circle and not the servo slewing.
-      driveAtTargetSpeed();
+      setChannelPulse(ESC_CH, THROTTLE_TURN_US);
       if (millis() - phaseStart >= SETTLE_MS) {
         resetLegState();
-        resetThrottle();
         phase = P_RECORD;
         phaseStart = millis();
       }
@@ -483,7 +439,7 @@ void loop() {
 
     case P_RECORD:
       setChannelPulse(STEER_CH, LEG_PULSE[leg]);
-      driveAtTargetSpeed();
+      setChannelPulse(ESC_CH, THROTTLE_TURN_US);
       recordProgress();
 
       if (fabsf(sweptDeg) >= TARGET_SWEEP_DEG)        finishLeg("full circle");
@@ -516,8 +472,6 @@ void loop() {
            " pkts=" + String(packetCount) +
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " swept=" + String(sweptDeg, 0) + "deg" +
-           " spd=" + String(speedFps, 1) +
-           " thr=" + String((int)throttleOffsetUs) +
            " n=" + String(sampleCount));
   }
 }
