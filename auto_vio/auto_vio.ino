@@ -24,7 +24,6 @@
 #include "nav_math.h"
 #include "route.h"
 #include "steering.h"
-#include "throttle.h"
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -39,18 +38,14 @@ const int PUMP_PIN  = 6;
 
 const int NEUTRAL_US = 1500;
 
-// Throttle is servoed to a ground speed rather than fixed, because a fixed
-// pulse is really an assumption about tank weight, grass, slope and battery
-// charge all at once -- and one that just moved an empty rover will not move a
-// full one. Offsets are from neutral; the same magnitude is applied below
-// neutral to reverse.
-const float TARGET_SPEED_FPS   = 1.2f;
-const float THROTTLE_MIN_OFFSET = 70.0f;   // past the ESC deadband
-const float THROTTLE_MAX_OFFSET = 400.0f;  // headroom for a full tank in grass
-const float THROTTLE_START_OFFSET = 150.0f;
-const float THROTTLE_GAIN       = 15.0f;   // us per ft/s of error, per update
-const unsigned long THROTTLE_UPDATE_MS = 200;
-const float SPEED_SMOOTHING     = 0.4f;
+// Fixed throttle pulses. These are the values from before the speed loop; they
+// were set against an empty rover, so a full tank may not move at all. Raise
+// THROTTLE_FWD_US (and the others with it) if it will not pull the weight --
+// 1620 is only 120us above neutral, barely clear of the ESC deadband, and
+// there is room up to about 1900.
+const int THROTTLE_FWD_US  = 1620;
+const int THROTTLE_TURN_US = 1600;
+const int THROTTLE_REV_US  = 1380;
 
 const int STEER_CENTER_US = 1500;
 const int STEER_LEFT_US   = 2390;
@@ -198,43 +193,6 @@ bool sprayInhibited = false;
 float offPlanFt = 0.0f;
 float worstOffThisPass = 0.0f;
 
-float speedFps = 0.0f;
-float throttleOffsetUs = THROTTLE_START_OFFSET;
-float speedPrevX = 0.0f, speedPrevY = 0.0f;
-unsigned long speedPrevMs = 0;
-
-void resetThrottle() {
-  throttleOffsetUs = THROTTLE_START_OFFSET;
-  speedFps = 0.0f;
-  speedPrevX = robotX_ft;
-  speedPrevY = robotY_ft;
-  speedPrevMs = millis();
-}
-
-// Measure how fast the rover is actually going, and move the throttle toward
-// whatever pulse delivers the target. A rover that is not moving at all shows
-// zero speed, so this winds the throttle up until it breaks away -- which is
-// exactly the case where a fixed pulse tuned on an empty rover leaves a loaded
-// one sitting still.
-void updateThrottle(bool moving) {
-  unsigned long now = millis();
-  if (now - speedPrevMs < THROTTLE_UPDATE_MS) return;
-
-  speedFps = updateSpeedFps(speedFps, robotX_ft - speedPrevX,
-                            robotY_ft - speedPrevY, now - speedPrevMs,
-                            SPEED_SMOOTHING);
-  speedPrevX = robotX_ft;
-  speedPrevY = robotY_ft;
-  speedPrevMs = now;
-
-  // Only servo while the rover is actually being asked to drive; holding at
-  // neutral would otherwise wind the throttle to its limit for the restart.
-  if (!moving) return;
-
-  throttleOffsetUs = governThrottle(throttleOffsetUs, speedFps, TARGET_SPEED_FPS,
-                                    THROTTLE_GAIN, THROTTLE_MIN_OFFSET,
-                                    THROTTLE_MAX_OFFSET);
-}
 
 void bleLog(String msg) {
   if (bleConnected && txCharacteristic != NULL) {
@@ -435,10 +393,10 @@ void runDriveTest() {
   }
 
   float fwd = 0.0f, rev = 0.0f;
-  bool movedFwd = measureDrive(NEUTRAL_US + (int)THROTTLE_START_OFFSET, fwd);
+  bool movedFwd = measureDrive(THROTTLE_FWD_US, fwd);
   bleLog("Forward: moved " + String(fwd, 2) + " ft along its nose.");
   if (!movedFwd) {
-    bleLog("[FAIL] Did not move forward. Raise THROTTLE_START_OFFSET, or the");
+    bleLog("[FAIL] Did not move forward. Raise THROTTLE_FWD_US, or the");
     bleLog("       drive battery / ESC is not delivering power.");
   } else if (fwd < 0.0f) {
     bleLog("[FAIL] Moved BACKWARDS on a forward command -- ESC is reversed.");
@@ -446,7 +404,7 @@ void runDriveTest() {
     bleLog("[PASS] Forward works.");
   }
 
-  bool movedRev = measureDrive(NEUTRAL_US - (int)THROTTLE_START_OFFSET, rev);
+  bool movedRev = measureDrive(THROTTLE_REV_US, rev);
   bleLog("Reverse: moved " + String(rev, 2) + " ft along its nose.");
   if (!movedRev) {
     bleLog("[FAIL] REVERSE DID NOT ENGAGE. This is fatal for the route: every");
@@ -579,7 +537,6 @@ void planRoute() {
   sprayInhibited = false;
   offPlanFt = 0.0f;
   worstOffThisPass = 0.0f;
-  resetThrottle();
   escReverse = false;
   dirChangeAt = millis();
 
@@ -765,15 +722,12 @@ void runFollow() {
     polarityLastHeading = robotHeading;   // don't let a reverse leg pollute it
   }
 
-  bool pausing = (millis() - dirChangeAt < DIR_CHANGE_PAUSE_MS);
-  updateThrottle(!pausing);
-
-  if (pausing) {
+  if (millis() - dirChangeAt < DIR_CHANGE_PAUSE_MS) {
     setChannelPulse(ESC_CH, NEUTRAL_US);   // let the ESC re-arm
   } else if (reversing) {
-    setChannelPulse(ESC_CH, NEUTRAL_US - (int)throttleOffsetUs);
+    setChannelPulse(ESC_CH, THROTTLE_REV_US);
   } else {
-    setChannelPulse(ESC_CH, NEUTRAL_US + (int)throttleOffsetUs);
+    setChannelPulse(ESC_CH, fabsf(err) > 45.0f ? THROTTLE_TURN_US : THROTTLE_FWD_US);
   }
 
   updateSpray();
@@ -962,8 +916,6 @@ void loop() {
            " hdg=" + String(robotHeading, 0) +
            " pt=" + String(routeIndex) + "/" + String(routeCount) +
            " off=" + String(offPlanFt, 2) +
-           " spd=" + String(speedFps, 1) +
-           " thr=" + String((int)throttleOffsetUs) +
            " ctr=" + String((int)steerCentreUs()) +
            (dryRunMode ? " DRY" : " WET") +
            (sprayActive ? " spray=ON" : " spray=OFF") +
