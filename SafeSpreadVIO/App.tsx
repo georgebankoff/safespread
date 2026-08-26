@@ -22,7 +22,7 @@ export default function App() {
   // stranding the rover mid-pass until its VIO timeout stops it.
   useKeepAwake();
 
-  const { pose, trackingState, trackingOk, zero } = useVIOPose();
+  const { pose, trackingState, trackingOk } = useVIOPose();
 
   // In dry mode nothing is dispensed, so the beep is the only audible cue that
   // the rover thinks it is spraying -- useful when it is across the yard.
@@ -104,14 +104,14 @@ export default function App() {
   useEffect(() => {
     const timer = setInterval(() => {
       const current = sendStateRef.current;
-      if (current.status === 'connected' && current.trackingOk) {
+      if (current.pose && current.status === 'connected' && current.trackingOk) {
         ble.sendPose(current.pose.x, current.pose.y, current.pose.heading);
         setSentCount((n) => n + 1);
       }
 
       // Trace the mission, including the headland turns, so the map shows the
       // real path and not just the sprayed parts.
-      if (current.running) {
+      if (current.pose && current.running) {
         const next: PathPoint = {
           x: current.pose.x,
           y: current.pose.y,
@@ -130,9 +130,9 @@ export default function App() {
   return (
     <View style={[styles.container, spraying && styles.containerSpraying]}>
       <View style={styles.hud}>
-        <Text style={styles.text}>X: {pose.x.toFixed(1)} ft</Text>
-        <Text style={styles.text}>Y: {pose.y.toFixed(1)} ft</Text>
-        <Text style={styles.text}>Hdg: {pose.heading.toFixed(0)}°</Text>
+        <Text style={styles.text}>X: {pose ? `${pose.x.toFixed(1)} ft` : '—'}</Text>
+        <Text style={styles.text}>Y: {pose ? `${pose.y.toFixed(1)} ft` : '—'}</Text>
+        <Text style={styles.text}>Hdg: {pose ? `${pose.heading.toFixed(0)}°` : '—'}</Text>
         <Text style={styles.text}>BLE: {status}</Text>
         <Text style={styles.text}>
           Tracking: {trackingState}
@@ -211,11 +211,8 @@ export default function App() {
             pressed && styles.pressed,
           ]}
           onPress={() => {
-            // Zeroing the origin must not happen unless the rover will
-            // actually restart from it.
-            zero();
-            // The old trace belongs to the old origin; keep the dimensions the
-            // run actually used so the map matches what was driven.
+            // The old trace belongs to the previous run; rectangle-frame
+            // coordinates are established by setup, not by this pose hook.
             setPath([]);
             setMapDims({ n: parseFloat(nText) || 0, m: parseFloat(mText) || 0 });
             ble.sendCommand('1');
