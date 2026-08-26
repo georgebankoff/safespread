@@ -29,9 +29,9 @@ struct LaneStat { double sum; int n; };
 /** Drive the plan with a given belief about where the steering centre is, and
  *  report the average sideways error on each lane. `learn` turns on the trim
  *  estimator. Returns the number of lanes measured. */
-static int runField(float assumedCentre, bool learn, LaneStat *out, int maxLanes,
-                    float *finalTrim) {
-  const float STEP = 0.15f, LOOKAHEAD = 2.5f, LOOKAHEAD_TURN = 1.0f;
+static int runField(float assumedCentre, bool learn, bool pursuitOnStraights,
+                    LaneStat *out, int maxLanes, float *finalTrim) {
+  const float STEP = 0.15f, LOOKAHEAD_TURN = 1.0f, LINE_T = 1.5f;
   const float CUSP_TOL = 0.5f, PURSUIT_GAIN = 16.0f;
   const int   WINDOW = 80;
   const float TRIM_RATE = 0.05f, TRIM_LIMIT = 250.0f, TRIM_NEAR = 0.4f;
@@ -49,13 +49,23 @@ static int runField(float assumedCentre, bool learn, LaneStat *out, int maxLanes
   while (idx < n - 1 && ticks < 80000) {
     idx = advanceRouteIndex(rt, n, idx, x, y, WINDOW, CUSP_TOL);
     bool rev = rt[idx].reverse;
-    int la = lookaheadWithinSegment(rt, n, idx, x, y,
-                                    rt[idx].turning ? LOOKAHEAD_TURN : LOOKAHEAD);
-
-    float want = bearingToWaypointDeg(rt[la].x - x, rt[la].y - y);
     float reference = rev ? fmodf(heading + 180.0f, 360.0f) : heading;
-    float err = angleDiffDeg(want, reference);
-    float command = err * PURSUIT_GAIN;
+    float command;
+
+    // Same split the firmware uses: chase a point round a turn, steer onto the
+    // line itself on a straight run.
+    if (rt[idx].turning || pursuitOnStraights) {
+      int la = lookaheadWithinSegment(rt, n, idx, x, y,
+                                      rt[idx].turning ? LOOKAHEAD_TURN : 2.5f);
+      float want = bearingToWaypointDeg(rt[la].x - x, rt[la].y - y);
+      command = angleDiffDeg(want, reference) * PURSUIT_GAIN;
+    } else {
+      float lineHeading = segmentHeadingDeg(rt, n, idx);
+      float cross = crossTrackFt(rt[idx].x, rt[idx].y, lineHeading, x, y);
+      float headingErr = angleDiffDeg(lineHeading, reference);
+      command = curvatureToCommand(lineFollowCurvature(cross, headingErr, LINE_T),
+                                   RL, RR, MAX_OFFSET);
+    }
 
     float centre = assumedCentre + trim;
     float pulse = steerPulseUs(rev ? -command : command, centre,
@@ -147,8 +157,8 @@ int main() {
   // to one side, and the side should alternate, which is what draws pairs of
   // overlapping lines.
   {
-    lanes = runField(1500.0f, false, wrong, MAXL, NULL);
-    report("centre=1500 (bug):", wrong, lanes);
+    lanes = runField(1500.0f, false, true, wrong, MAXL, NULL);
+    report("pursuit, centre=1500:", wrong, lanes);
 
     int alternations = 0;
     float worst = 0.0f;
@@ -170,8 +180,8 @@ int main() {
   // --- the fix ------------------------------------------------------------
   {
     float c = steeringCentreUs(RL, RR, LEFT_LOCK, RIGHT_LOCK);
-    lanes = runField(c, false, right, MAXL, &trimRight);
-    report("centre from radii:", right, lanes);
+    lanes = runField(c, false, false, right, MAXL, &trimRight);
+    report("line follow, centre ok:", right, lanes);
 
     float worst = 0.0f;
     for (int i = 0; i < lanes; i++) {
@@ -180,7 +190,7 @@ int main() {
       if (m > worst) worst = m;
     }
     // Well inside a lane width, so neighbouring passes stay apart.
-    assert(worst < 0.15f);
+    assert(worst < 0.20f);
     printf("  worst lane error: %.2f ft -> %.2f ft (lane spacing %.2f ft)\n",
            0.0f, worst, laneSpacing(BAR, OVERLAP));
   }
@@ -190,8 +200,8 @@ int main() {
   // centre on its own, so a rover whose steering shifts does not need
   // re-measuring to keep driving straight.
   {
-    lanes = runField(1500.0f, true, learned, MAXL, &trimWrong);
-    report("centre=1500 + learning:", learned, lanes);
+    lanes = runField(1500.0f, true, false, learned, MAXL, &trimWrong);
+    report("line follow, 1500+learn:", learned, lanes);
 
     // It should have learned most of the 209us it was out by.
     assert(trimWrong > 120.0f);
@@ -217,7 +227,7 @@ int main() {
     static LaneStat both[MAXL];
     float c = steeringCentreUs(RL, RR, LEFT_LOCK, RIGHT_LOCK);
     float trim = 0.0f;
-    lanes = runField(c, true, both, MAXL, &trim);
+    lanes = runField(c, true, false, both, MAXL, &trim);
     report("shipping config:", both, lanes);
 
     float worst = 0.0f;

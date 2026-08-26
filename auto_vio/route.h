@@ -35,7 +35,7 @@ const float ROUTE_STEP_FT = 0.5f;
 // turn before it has finished the pass and the last stretch goes unsprayed --
 // and it enters the next pass still settling onto the line. The run-up is
 // driven with spray off, so it costs coverage nothing.
-const float HEADLAND_MARGIN_FT = 2.5f;
+const float HEADLAND_MARGIN_FT = 3.5f;
 
 // Turns are planned a little wider than the rover can actually manage. An arc
 // at exactly the minimum radius needs full lock the whole way round, which
@@ -114,6 +114,21 @@ inline int segmentEndIndex(const RoutePoint *route, int count, int fromIndex) {
   int i = fromIndex;
   while (i + 1 < count && route[i + 1].reverse == rev) i++;
   return i;
+}
+
+/** Direction of the straight run the rover is currently on, as a rover
+ *  heading. Taken across several points so a single point's rounding does not
+ *  swing the answer. */
+inline float segmentHeadingDeg(const RoutePoint *route, int count, int idx) {
+  int end = segmentEndIndex(route, count, idx);
+  int a = idx, b = idx + 4;
+  if (b > end) b = end;
+  if (b <= a) {                      // at the very end of a run: look back
+    b = idx;
+    a = (idx >= 4) ? idx - 4 : 0;
+  }
+  if (b <= a) return 0.0f;
+  return bearingToWaypointDeg(route[b].x - route[a].x, route[b].y - route[a].y);
 }
 
 /** Lookahead that never aims past a cusp. Beyond one the plan doubles back, so

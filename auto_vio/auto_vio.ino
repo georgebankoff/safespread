@@ -147,9 +147,13 @@ int firstPassEnd = 0;      // route index where the all-important first pass end
 // Steer at a point this far ahead on the path. On a straight pass a long
 // lookahead tracks smoothly; through a turn it must be shorter than the arc's
 // radius or the rover simply cuts the corner and misses the maneuver.
-const float LOOKAHEAD_FT      = 2.5f;
 const float LOOKAHEAD_TURN_FT = 1.0f;
 const float PURSUIT_GAIN      = 16.0f;   // us of steering per degree of error
+
+// How sharply the rover converges onto a straight pass, in feet. Smaller is
+// quicker but works the steering harder against position noise; 1.5 ft closes
+// a foot of error in about 6 ft of travel without ever crossing the line.
+const float LINE_DISTANCE_CONST_FT = 1.5f;
 const int   ROUTE_SEARCH_WINDOW = 80;
 const float CUSP_TOL_FT       = 0.5f;
 
@@ -547,14 +551,6 @@ void runFollow() {
     }
   }
 
-  int la = lookaheadWithinSegment(route, routeCount, routeIndex,
-                                  robotX_ft, robotY_ft,
-                                  route[routeIndex].turning ? LOOKAHEAD_TURN_FT
-                                                            : LOOKAHEAD_FT);
-
-  float want = bearingToWaypointDeg(route[la].x - robotX_ft,
-                                    route[la].y - robotY_ft);
-
   // Backing up, the rover travels in the direction opposite its nose. Course
   // over ground is preferred going forward, where it cancels out any error in
   // how the phone is mounted; reverse legs are short enough that the reported
@@ -566,8 +562,33 @@ void runFollow() {
     reference = courseValid ? courseDeg : robotHeading;
   }
 
-  float err = angleDiffDeg(want, reference);
-  float command = err * PURSUIT_GAIN;
+  float err, command;
+
+  if (route[routeIndex].turning) {
+    // Through a turn there is no line to hold, only a curve to follow, so aim
+    // at a point a short way along it.
+    int la = lookaheadWithinSegment(route, routeCount, routeIndex,
+                                    robotX_ft, robotY_ft, LOOKAHEAD_TURN_FT);
+    float want = bearingToWaypointDeg(route[la].x - robotX_ft,
+                                      route[la].y - robotY_ft);
+    err = angleDiffDeg(want, reference);
+    command = err * PURSUIT_GAIN;
+  } else {
+    // On a straight run -- which is every sprayed pass -- steer onto the line
+    // itself rather than at a point ahead of it. Chasing a point ahead reaches
+    // the line still carrying heading error and crosses it, and a pass is far
+    // too short to settle that out: from a foot off, chasing takes 11 ft to
+    // straighten and a pass is only 14. This converges in about 6 ft and never
+    // crosses over.
+    float lineHeading = segmentHeadingDeg(route, routeCount, routeIndex);
+    float cross = crossTrackFt(route[routeIndex].x, route[routeIndex].y,
+                               lineHeading, robotX_ft, robotY_ft);
+    err = angleDiffDeg(lineHeading, reference);
+
+    float kappa = lineFollowCurvature(cross, err, LINE_DISTANCE_CONST_FT);
+    command = curvatureToCommand(kappa, turnRadiusLeftFt, turnRadiusRightFt,
+                                 MAX_STEER_OFFSET);
+  }
 
   // Steering acts on the direction of travel the opposite way in reverse:
   // right lock swings the nose left, so the same command turns the rover's
