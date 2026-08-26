@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import ArkitPoseModule from '../modules/arkit-pose/src/ArkitPoseModule';
 import { applyOrigin, Pose } from './poseMath';
 
 export function useVIOPose() {
   const [raw, setRaw] = useState<Pose>({ x: 0, y: 0, heading: 0 });
   const [trackingOk, setTrackingOk] = useState(false);
-  const originRef = useRef<Pose | null>(null);
+  const [origin, setOrigin] = useState<Pose | null>(null);
 
   useEffect(() => {
     ArkitPoseModule.start();
@@ -20,8 +20,8 @@ export function useVIOPose() {
   }, []);
 
   const zero = useCallback(() => {
-    originRef.current = raw;
+    setOrigin(raw);
   }, [raw]);
 
-  return { pose: applyOrigin(raw, originRef.current), trackingOk, zero };
+  return { pose: applyOrigin(raw, origin), trackingOk, zero };
 }
