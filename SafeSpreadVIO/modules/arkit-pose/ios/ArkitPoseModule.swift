@@ -94,6 +94,7 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
       "trackingReason": trackingReason,
       "mappingStatus": mappingStatus,
       "frameTimestampMs": frame.timestamp * 1000.0,
+      "emittedTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
       "sequence": sequence,
     ])
   }
@@ -121,6 +122,7 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
       "trackingReason": reason,
       "mappingStatus": "notAvailable",
       "frameTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
+      "emittedTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
       "sequence": sequence,
     ]
     if let error { payload["error"] = error }

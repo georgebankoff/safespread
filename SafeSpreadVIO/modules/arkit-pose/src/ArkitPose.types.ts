@@ -21,6 +21,7 @@ export function isPoseUsable(state: TrackingState): boolean {
 
 type TrackingMetadata = {
   frameTimestampMs: number;
+  emittedTimestampMs: number;
   sequence: number;
   trackingState: TrackingState;
   trackingReason: TrackingReason;

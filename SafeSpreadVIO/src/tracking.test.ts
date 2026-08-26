@@ -32,6 +32,7 @@ describe('ARKit tracking eligibility', () => {
     const event: PoseUpdatePayload = {
       kind: 'status',
       frameTimestampMs: 1250,
+      emittedTimestampMs: 1250,
       sequence: 42,
       trackingState: 'notAvailable',
       trackingReason: 'interrupted',
