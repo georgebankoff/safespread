@@ -192,9 +192,59 @@ bool passGoesUp = true;
 inline float passTargetY()      { return passGoesUp ? fieldPassFt : 0.0f; }
 inline float passDesiredHeading(){ return passGoesUp ? 0.0f : 180.0f; }
 
+// PCA9685 registers. An I2C ACK only proves the chip is powered and
+// addressable; it says nothing about whether it is still configured.
+#define PCA_MODE1     0x00
+#define PCA_PRESCALE  0xFE
+#define PCA_SLEEP_BIT 0x10
+// 25MHz / (4096 * 50Hz) - 1
+#define PCA_EXPECTED_PRESCALE 121
+
+int lastSteerUs = STEER_CENTER_US;
+int lastEscUs   = NEUTRAL_US;
+unsigned long lastPwmCheck = 0;
+unsigned long pwmRecoveries = 0;
+
 void setChannelPulse(uint8_t channel, int microseconds) {
+  if (channel == STEER_CH) lastSteerUs = microseconds;
+  if (channel == ESC_CH)   lastEscUs = microseconds;
   uint16_t ticks = (uint16_t)(((uint32_t)microseconds * 4096UL) / 20000UL);
   pwm.setPWM(channel, 0, ticks);
+}
+
+uint8_t readPcaRegister(uint8_t reg) {
+  Wire.beginTransmission(PCA9685_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return 0xFF;
+  if (Wire.requestFrom((int)PCA9685_ADDR, 1) != 1) return 0xFF;
+  return Wire.read();
+}
+
+// A brownout -- typically the steering servo stalling and sagging the rail --
+// resets the PCA9685 into its power-on state: asleep, prescaler unset, all
+// outputs dead. The ESP32 rides through on its own decoupling and never
+// notices, so the sketch keeps sending pulses to a chip that is ignoring
+// them. Detect that and reconfigure instead of assuming setup() still holds.
+bool ensurePwmReady() {
+  uint8_t mode1 = readPcaRegister(PCA_MODE1);
+  uint8_t prescale = readPcaRegister(PCA_PRESCALE);
+
+  if (mode1 == 0xFF && prescale == 0xFF) return false;  // not reachable at all
+
+  bool asleep = (mode1 & PCA_SLEEP_BIT) != 0;
+  bool wrongRate = abs((int)prescale - PCA_EXPECTED_PRESCALE) > 3;
+  if (!asleep && !wrongRate) return true;
+
+  pwmRecoveries++;
+  bleLog("!! PWM chip lost its config (mode1=0x" + String(mode1, HEX) +
+         " prescale=" + String(prescale) + "). Reinitialising.");
+  pwm.begin();
+  pwm.setPWMFreq(50);
+  delay(10);
+  // Restore whatever was last commanded so recovery is not a jolt.
+  setChannelPulse(STEER_CH, lastSteerUs);
+  setChannelPulse(ESC_CH, lastEscUs);
+  return true;
 }
 
 // In dry-run mode the spray state is still tracked and reported so the app
@@ -269,6 +319,28 @@ void runSelfTest() {
   }
 
   bleLog("[PASS] I2C OK (PCA9685 @ 0x40)");
+
+  // Addressable is not the same as configured: report the registers that
+  // actually decide whether pulses come out.
+  uint8_t mode1 = readPcaRegister(PCA_MODE1);
+  uint8_t prescale = readPcaRegister(PCA_PRESCALE);
+  bool asleep = (mode1 & PCA_SLEEP_BIT) != 0;
+  bool wrongRate = abs((int)prescale - PCA_EXPECTED_PRESCALE) > 3;
+
+  if (asleep || wrongRate) {
+    bleLog("[FAIL] Chip answers but is not configured:");
+    if (asleep)    bleLog("       SLEEP set -- outputs are off (brownout reset?)");
+    if (wrongRate) bleLog("       prescale=" + String(prescale) + ", expected ~" +
+                          String(PCA_EXPECTED_PRESCALE));
+    bleLog("       Reinitialising now.");
+    ensurePwmReady();
+  } else {
+    bleLog("[PASS] Configured: awake, prescale=" + String(prescale) + " (50Hz)");
+  }
+  if (pwmRecoveries) {
+    bleLog("[INFO] Recovered from " + String(pwmRecoveries) +
+           " brownout(s) since boot -- check servo power.");
+  }
 
   setChannelPulse(ESC_CH, NEUTRAL_US);
 
@@ -700,6 +772,12 @@ void loop() {
     qTail = (qTail + 1) % QSLOTS;
   }
 
+  // Catch a browned-out PWM chip within half a second, whether driving or not.
+  if (millis() - lastPwmCheck >= 500) {
+    lastPwmCheck = millis();
+    ensurePwmReady();
+  }
+
   // 1Hz telemetry so a silent rover is diagnosable: distinguishes "no pose
   // packets arriving" from "packets fine, navigation misbehaving".
   if (millis() - lastTelemetryTime >= 1000) {
@@ -720,7 +798,8 @@ void loop() {
            " hdg=" + String(robotHeading, 0) +
            " lane=" + String(currentLane + 1) + "/" + String(totalLanes) +
            (dryRunMode ? " DRY" : " WET") +
-           (sprayActive ? " spray=ON" : " spray=OFF"));
+           (sprayActive ? " spray=ON" : " spray=OFF") +
+           (pwmRecoveries ? " pwmfix=" + String(pwmRecoveries) : ""));
   }
 
   if (vioActive && (millis() - lastVioTime > VIO_TIMEOUT_MS)) {
