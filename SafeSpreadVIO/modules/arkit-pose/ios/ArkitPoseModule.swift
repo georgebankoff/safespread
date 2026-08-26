@@ -35,6 +35,7 @@ public class ArkitPoseModule: Module {
 
 private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
   private let onUpdate: ([String: Any]) -> Void
+  private var sequence: UInt32 = 0
 
   init(onUpdate: @escaping ([String: Any]) -> Void) {
     self.onUpdate = onUpdate
@@ -55,17 +56,74 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
     if headingDeg < 0 { headingDeg += 360 }
 
     let trackingState: String
+    let trackingReason: String
     switch frame.camera.trackingState {
-    case .normal: trackingState = "normal"
-    case .limited: trackingState = "limited"
-    case .notAvailable: trackingState = "notAvailable"
+    case .normal:
+      trackingState = "normal"
+      trackingReason = "none"
+    case .limited(let reason):
+      trackingState = "limited"
+      switch reason {
+      case .initializing: trackingReason = "initializing"
+      case .excessiveMotion: trackingReason = "excessiveMotion"
+      case .insufficientFeatures: trackingReason = "insufficientFeatures"
+      case .relocalizing: trackingReason = "relocalizing"
+      @unknown default: trackingReason = "unknown"
+      }
+    case .notAvailable:
+      trackingState = "notAvailable"
+      trackingReason = "unknown"
     }
 
+    let mappingStatus: String
+    switch frame.worldMappingStatus {
+    case .notAvailable: mappingStatus = "notAvailable"
+    case .limited: mappingStatus = "limited"
+    case .extending: mappingStatus = "extending"
+    case .mapped: mappingStatus = "mapped"
+    @unknown default: mappingStatus = "unknown"
+    }
+
+    sequence &+= 1
     onUpdate([
+      "kind": "pose",
       "x": xFt,
       "y": yFt,
       "heading": headingDeg,
       "trackingState": trackingState,
+      "trackingReason": trackingReason,
+      "mappingStatus": mappingStatus,
+      "frameTimestampMs": frame.timestamp * 1000.0,
+      "sequence": sequence,
     ])
+  }
+
+  func session(_ session: ARSession, didFailWithError error: Error) {
+    emitStatus(reason: "sessionFailed", error: error.localizedDescription)
+  }
+
+  func sessionWasInterrupted(_ session: ARSession) {
+    emitStatus(reason: "interrupted")
+  }
+
+  func sessionInterruptionEnded(_ session: ARSession) {
+    emitStatus(state: "limited", reason: "relocalizing")
+  }
+
+  private func emitStatus(
+    state: String = "notAvailable",
+    reason: String,
+    error: String? = nil
+  ) {
+    var payload: [String: Any] = [
+      "kind": "status",
+      "trackingState": state,
+      "trackingReason": reason,
+      "mappingStatus": "notAvailable",
+      "frameTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
+      "sequence": sequence,
+    ]
+    if let error { payload["error"] = error }
+    onUpdate(payload)
   }
 }
