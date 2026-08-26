@@ -60,7 +60,7 @@ export class SafeSpreadBLE {
     );
   }
 
-  async sendCommand(command: '1' | '2'): Promise<void> {
+  async sendCommand(command: '1' | '2' | '3'): Promise<void> {
     if (!this.device) return;
     const packet = new Uint8Array([command.charCodeAt(0)]);
     await this.device.writeCharacteristicWithoutResponseForService(
