@@ -21,6 +21,8 @@ export default function App() {
   const [areaNote, setAreaNote] = useState('');
   const [telemetry, setTelemetry] = useState('');
   const [log, setLog] = useState<string[]>([]);
+  const [dryRun, setDryRun] = useState(false);
+  const [spraying, setSpraying] = useState(false);
   const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
@@ -41,6 +43,10 @@ export default function App() {
       // it scroll the interesting mission messages away.
       if (line.startsWith('[TLM]')) {
         setTelemetry(line.slice(5).trim());
+      } else if (line === '[SPRAY] ON' || line === '[SPRAY] OFF') {
+        setSpraying(line.endsWith('ON'));
+      } else if (line === '[MODE] DRY' || line === '[MODE] WET') {
+        setDryRun(line.endsWith('DRY'));
       } else {
         setLog((prev) => [...prev.slice(-40), line]);
       }
@@ -61,7 +67,7 @@ export default function App() {
   }, [status, trackingOk, pose]);
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, spraying && styles.containerSpraying]}>
       <View style={styles.crosshair} />
       <View style={styles.hud}>
         <Text style={styles.text}>X: {pose.x.toFixed(1)} ft</Text>
@@ -132,6 +138,12 @@ export default function App() {
         <Pressable style={styles.testButton} onPress={() => ble.sendCommand('3')}>
           <Text style={styles.buttonText}>Self Test</Text>
         </Pressable>
+        <Pressable
+          style={[styles.modeButton, dryRun ? styles.modeDry : styles.modeWet]}
+          onPress={() => ble.sendCommand('4')}
+        >
+          <Text style={styles.buttonText}>{dryRun ? 'DRY' : 'WET'}</Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -139,6 +151,7 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black' },
+  containerSpraying: { backgroundColor: '#b00020' },
   crosshair: {
     position: 'absolute',
     top: '50%',
@@ -210,5 +223,8 @@ const styles = StyleSheet.create({
   },
   button: { backgroundColor: '#2e7d32', paddingVertical: 14, paddingHorizontal: 24, borderRadius: 8 },
   testButton: { backgroundColor: '#1565c0', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 8 },
+  modeButton: { paddingVertical: 14, paddingHorizontal: 18, borderRadius: 8 },
+  modeDry: { backgroundColor: '#6a1b9a' },
+  modeWet: { backgroundColor: '#ef6c00' },
   buttonText: { color: 'white', fontSize: 16, fontWeight: '700' },
 });
