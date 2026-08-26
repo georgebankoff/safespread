@@ -28,7 +28,8 @@
     },
     "plugins": [
       "expo-dev-client",
-      "expo-audio"
+      "expo-audio",
+      "expo-sharing"
     ]
   }
 }
