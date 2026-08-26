@@ -59,4 +59,14 @@ export class SafeSpreadBLE {
       Buffer.from(packet).toString('base64')
     );
   }
+
+  async sendCommand(command: '1' | '2'): Promise<void> {
+    if (!this.device) return;
+    const packet = new Uint8Array([command.charCodeAt(0)]);
+    await this.device.writeCharacteristicWithoutResponseForService(
+      NUS_SERVICE_UUID,
+      NUS_TX_UUID,
+      Buffer.from(packet).toString('base64')
+    );
+  }
 }

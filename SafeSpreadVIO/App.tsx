@@ -36,10 +36,16 @@ export default function App() {
         <Text style={styles.text}>Tracking: {trackingOk ? 'OK' : 'DEGRADED'}</Text>
       </View>
       <View style={styles.buttons}>
-        <Pressable style={styles.button} onPress={zero}>
+        <Pressable
+          style={styles.button}
+          onPress={() => {
+            zero();
+            ble.sendCommand('1');
+          }}
+        >
           <Text style={styles.buttonText}>Start / Reset</Text>
         </Pressable>
-        <Pressable style={styles.button} onPress={() => ble.disconnect()}>
+        <Pressable style={styles.button} onPress={() => ble.sendCommand('2')}>
           <Text style={styles.buttonText}>Stop</Text>
         </Pressable>
       </View>
