@@ -56,32 +56,6 @@ inline int laneCount(float widthFt, float barWidthFt, float overlapFraction) {
   return (n < 1) ? 1 : n;
 }
 
-struct Waypoint {
-  float x;
-  float y;
-};
-
-inline int buildWaypoints(float widthFt, float lengthFt, float barWidthFt,
-                           float overlapFraction, Waypoint* out, int maxOut) {
-  float spacingTarget = barWidthFt * (1.0f - overlapFraction);
-  int lanes = (int)ceilf(widthFt / spacingTarget) + 1;
-  if (lanes < 2) lanes = 2;
-  float spacing = widthFt / (float)(lanes - 1);
-
-  auto endY = [&](int lane) -> float {
-    return (lane % 2 == 0) ? lengthFt : 0.0f;
-  };
-
-  int idx = 0;
-  if (idx < maxOut) out[idx++] = { 0.0f, endY(0) };
-  for (int lane = 1; lane < lanes && idx + 1 < maxOut; lane++) {
-    float x2 = lane * spacing;
-    out[idx++] = { x2, endY(lane - 1) };
-    out[idx++] = { x2, endY(lane) };
-  }
-  return idx;
-}
-
 // --- Pure pursuit --------------------------------------------------------
 // Steer at a point a fixed distance ahead on the planned path. Drift pulls the
 // lookahead point off to one side, which steers back onto the line, so the

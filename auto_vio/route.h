@@ -1,113 +1,219 @@
 #pragma once
 #include "nav_math.h"
-#include "dubins.h"
+#include "turn.h"
 
 // The whole mission, computed once before the rover moves: a dense list of
-// points to follow, each flagged for spray. Planning up front is what stops
-// the rover re-deciding its route from its own tracking error, which is how
-// small position errors used to turn into completely different maneuvers.
+// points to follow, each flagged for spray and for reversing. Planning up
+// front is what stops the rover re-deciding its route from its own tracking
+// error, which is how small position errors used to turn into completely
+// different maneuvers.
+//
+// Lanes are driven in order -- 0, 1, 2, ... -- the way a person mowing a lawn
+// does it, joined by three-point turns. That ordering only became affordable
+// once turns could reverse: a forward-only turn between neighbouring lanes has
+// to loop right out and come back, and used to cost 28.7 ft against 12.6 ft
+// for a lane a full turning diameter away, which is why the route used to skip
+// lanes and pick them up on later sweeps. A three-point turn does the same
+// move in 10.1 ft, so the simple order is now also the cheap one.
 
 struct RoutePoint {
   float x;
   float y;
-  bool spray;
+  bool  spray;
+  bool  reverse;
+  // Set on the arcs of a turn. The tracker aims at a point a fixed distance
+  // ahead, and a lookahead longer than the arc's radius cuts the corner
+  // instead of following it -- with a 2.9 ft turning circle, the 2.5 ft
+  // lookahead that suits a straight pass misses the turn completely.
+  bool  turning;
 };
 
 const float ROUTE_STEP_FT = 0.5f;
 
-// Rover heading (0 = +Y, clockwise) <-> maths heading (0 = +X, CCW).
-inline float headingToMath(float headingDeg) {
-  return (90.0f - headingDeg) * (float)M_PI / 180.0f;
-}
+// Straight run-up outside the rectangle at each end of a pass. The tracker
+// aims a lookahead ahead of itself, so without this it starts easing into the
+// turn before it has finished the pass and the last stretch goes unsprayed --
+// and it enters the next pass still settling onto the line. The run-up is
+// driven with spray off, so it costs coverage nothing.
+const float HEADLAND_MARGIN_FT = 2.5f;
 
-/** Lanes are visited a turning-diameter apart so each U-turn is a simple half
- *  circle rather than a loop-out-and-back, then the skipped ones are picked up
- *  on later sweeps. Returns how many lane indices were written. */
-inline int buildLaneOrder(int totalLanes, int skip, int *out, int maxOut) {
-  if (skip < 1) skip = 1;
+// Turns are planned a little wider than the rover can actually manage. An arc
+// at exactly the minimum radius needs full lock the whole way round, which
+// leaves nothing in reserve: the tracker cannot pull back in when it drifts
+// wide, because it is already steering as hard as it can. Planning at 1.3x
+// keeps steering off the stop, so drift is correctable in both directions.
+// The cost is a slightly longer turn; the benefit is that the rover exits it
+// on the lane it aimed for rather than a foot or two beside it.
+const float TURN_PLANNING_MARGIN = 1.3f;
+
+/** Points along a straight line, excluding the start (the previous segment
+ *  already ended there) and landing exactly on the end, so consecutive
+ *  segments join without a gap the tracker would read as a jump. */
+inline int emitLineTo(RoutePoint *out, int maxOut, float x1, float y1,
+                      float x2, float y2, bool spray, bool reverse) {
+  float dx = x2 - x1, dy = y2 - y1;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len < 1e-6f || maxOut <= 0) return 0;
+
   int n = 0;
-  for (int offset = 0; offset < skip && n < maxOut; offset++) {
-    for (int lane = offset; lane < totalLanes && n < maxOut; lane += skip) {
-      out[n++] = lane;
-    }
+  int steps = (int)(len / ROUTE_STEP_FT);
+  for (int k = 1; k <= steps && n < maxOut; k++) {
+    float t = (k * ROUTE_STEP_FT) / len;
+    out[n].x = x1 + dx * t;
+    out[n].y = y1 + dy * t;
+    out[n].spray = spray;
+    out[n].reverse = reverse;
+    out[n].turning = false;
+    n++;
+  }
+  if (n < maxOut &&
+      (n == 0 || fabsf(out[n - 1].x - x2) > 1e-4f || fabsf(out[n - 1].y - y2) > 1e-4f)) {
+    out[n].x = x2; out[n].y = y2; out[n].spray = spray; out[n].reverse = reverse;
+    out[n].turning = false;
+    n++;
   }
   return n;
 }
 
-inline int laneSkipFor(float turnRadiusFt, float barWidthFt, float overlapFraction,
-                       int totalLanes) {
-  float s = laneSpacing(barWidthFt, overlapFraction);
-  int k = (int)lroundf((2.0f * turnRadiusFt) / s);
-  if (k < 1) k = 1;
-  if (totalLanes > 1 && k > totalLanes - 1) k = totalLanes - 1;
-  return k;
+/** Points along a headland turn, transformed from the maneuver's own frame
+ *  into the field. The rover's local +X is its right hand, which points along
+ *  world +X on an outbound pass and world -X coming back. */
+inline int emitTurn(RoutePoint *out, int maxOut, const TurnPlan &p,
+                    float x0, float y0, float h0Deg) {
+  if (maxOut <= 0) return 0;
+  float ch = cosf(turnRad(h0Deg)), sh = sinf(turnRad(h0Deg));
+  int n = 0;
+
+  for (float s = ROUTE_STEP_FT; s < p.lengthFt && n < maxOut; s += ROUTE_STEP_FT) {
+    float lx, ly, lh; bool rev;
+    turnPoseAt(p, s, lx, ly, lh, rev);
+    out[n].x = x0 + lx * ch + ly * sh;
+    out[n].y = y0 - lx * sh + ly * ch;
+    out[n].spray = false;      // never spray through a turn
+    out[n].reverse = rev;
+    out[n].turning = true;
+    n++;
+  }
+  if (n < maxOut) {
+    float lx, ly, lh; bool rev;
+    turnPoseAt(p, p.lengthFt, lx, ly, lh, rev);
+    out[n].x = x0 + lx * ch + ly * sh;
+    out[n].y = y0 - lx * sh + ly * ch;
+    out[n].spray = false;
+    out[n].reverse = false;    // the turn always finishes driving forward
+    out[n].turning = true;
+    n++;
+  }
+  return n;
 }
 
-/** Emit the full route: each lane driven end to end with spray on, joined by
- *  Dubins transits with spray off. Returns the number of points written. */
+/** Last point of the run the rover is currently driving, i.e. the next cusp
+ *  or the end of the plan. */
+inline int segmentEndIndex(const RoutePoint *route, int count, int fromIndex) {
+  bool rev = route[fromIndex].reverse;
+  int i = fromIndex;
+  while (i + 1 < count && route[i + 1].reverse == rev) i++;
+  return i;
+}
+
+/** Lookahead that never aims past a cusp. Beyond one the plan doubles back, so
+ *  a target on the far side would steer for a leg the rover is not driving
+ *  yet -- and on a three-point turn that is a target roughly behind it. */
+inline int lookaheadWithinSegment(const RoutePoint *route, int count,
+                                  int fromIndex, float x, float y,
+                                  float lookaheadFt) {
+  int end = segmentEndIndex(route, count, fromIndex);
+  float need = lookaheadFt * lookaheadFt;
+  for (int i = fromIndex; i <= end; i++) {
+    float dx = route[i].x - x, dy = route[i].y - y;
+    if (dx * dx + dy * dy >= need) return i;
+  }
+  return end;
+}
+
+/** Advance the tracked index along the plan. Progress stays inside the current
+ *  run of same-direction points and steps across a cusp only once the rover
+ *  has actually reached it, so a reverse leg doubling back alongside the
+ *  forward leg it came from cannot make the tracker skip ahead. */
+inline int advanceRouteIndex(const RoutePoint *route, int count, int fromIndex,
+                             float x, float y, int searchWindow,
+                             float cuspTolFt) {
+  int end = segmentEndIndex(route, count, fromIndex);
+  int window = end - fromIndex + 1;
+  if (window > searchWindow) window = searchWindow;
+
+  int idx = nearestRouteIndex(route, count, fromIndex, x, y, window);
+  if (idx < end || end + 1 >= count) return idx;
+
+  // Close enough to call the leg finished.
+  float dx = route[end].x - x, dy = route[end].y - y;
+  if (dx * dx + dy * dy <= cuspTolFt * cuspTolFt) return end + 1;
+
+  // Or already past it. Without this the rover that overshoots a cusp keeps
+  // driving away from it forever, because the index cannot advance and the
+  // target it is steering at is now behind.
+  if (end > 0) {
+    float tx = route[end].x - route[end - 1].x;
+    float ty = route[end].y - route[end - 1].y;
+    if (tx * (x - route[end].x) + ty * (y - route[end].y) > 0.0f) return end + 1;
+  }
+  return idx;
+}
+
+/** Emit the full route. `rLeftFt` and `rRightFt` are the rover's two turning
+ *  radii, carried separately because they are not the same size. Returns the
+ *  number of points written. */
 inline int buildRoute(float fieldPassFt, float fieldWidthFt,
                       float barWidthFt, float overlapFraction,
-                      float turnRadiusFt,
+                      float rLeftFt, float rRightFt,
                       RoutePoint *out, int maxOut) {
-  int totalLanes = laneCount(fieldWidthFt, barWidthFt, overlapFraction);
-  if (totalLanes < 1 || maxOut < 2) return 0;
+  int lanes = laneCount(fieldWidthFt, barWidthFt, overlapFraction);
+  if (lanes < 1 || maxOut < 2) return 0;
 
-  int order[64];
-  int lanesToDrive = buildLaneOrder(totalLanes, laneSkipFor(turnRadiusFt, barWidthFt,
-                                                            overlapFraction, totalLanes),
-                                    order, 64);
+  float planLeft  = rLeftFt * TURN_PLANNING_MARGIN;
+  float planRight = rRightFt * TURN_PLANNING_MARGIN;
 
+  // The route starts under the rover, spraying: the first pass runs straight
+  // ahead from where it was placed, and it is the pass the whole mission is
+  // lined up on.
   int n = 0;
-  bool haveExit = false;
-  float exitX = 0, exitY = 0, exitHeading = 0;
+  out[n].x = 0.0f; out[n].y = 0.0f; out[n].spray = true;
+  out[n].reverse = false; out[n].turning = false;
+  n++;
 
-  for (int i = 0; i < lanesToDrive && n < maxOut; i++) {
-    int lane = order[i];
-    float laneX = laneCenterX(lane, barWidthFt, overlapFraction);
-
-    // Alternate direction so consecutive passes run opposite ways, which is
-    // what makes a U-turn the right join between them.
-    bool goesUp = (i % 2) == 0;
+  for (int i = 0; i < lanes && n < maxOut; i++) {
+    float laneX  = laneCenterX(i, barWidthFt, overlapFraction);
+    bool  goesUp = (i % 2) == 0;
     float startY = goesUp ? 0.0f : fieldPassFt;
-    float endY = goesUp ? fieldPassFt : 0.0f;
-    float heading = goesUp ? 0.0f : 180.0f;
+    float endY   = goesUp ? fieldPassFt : 0.0f;
+    float dir    = goesUp ? 1.0f : -1.0f;
+    float headingDeg = goesUp ? 0.0f : 180.0f;
 
-    // Transit from the end of the previous pass to the start of this one.
-    if (haveExit) {
-      DubinsPath path;
-      bool ok = dubinsCompute(exitX, exitY, headingToMath(exitHeading),
-                              laneX, startY, headingToMath(heading),
-                              turnRadiusFt, path);
-      if (ok) {
-        float len = dubinsLength(path);
-        for (float s = ROUTE_STEP_FT; s < len && n < maxOut; s += ROUTE_STEP_FT) {
-          float px, py, pth;
-          dubinsPoseAt(path, s, px, py, pth);
-          out[n].x = px;
-          out[n].y = py;
-          out[n].spray = false;  // never spray through a turn
-          n++;
-        }
-      }
+    // Run in from the headland so the rover is straight and on the line
+    // before any spray comes out. The first pass has no run-in: the rover is
+    // already sitting at its start, which is how it gets aimed.
+    if (i > 0) {
+      n += emitLineTo(out + n, maxOut - n,
+                      laneX, startY - dir * HEADLAND_MARGIN_FT,
+                      laneX, startY, false, false);
     }
 
-    // The pass itself.
-    float dir = goesUp ? ROUTE_STEP_FT : -ROUTE_STEP_FT;
-    int steps = (int)(fieldPassFt / ROUTE_STEP_FT) + 1;
-    for (int s = 0; s <= steps && n < maxOut; s++) {
-      float y = startY + dir * s;
-      if (goesUp ? (y > endY) : (y < endY)) y = endY;
-      out[n].x = laneX;
-      out[n].y = y;
-      out[n].spray = true;
-      n++;
-      if (fabsf(y - endY) < 1e-4f) break;
-    }
+    n += emitLineTo(out + n, maxOut - n, laneX, startY, laneX, endY, true, false);
 
-    exitX = laneX;
-    exitY = endY;
-    exitHeading = heading;
-    haveExit = true;
+    if (i + 1 >= lanes) break;
+
+    float headlandY = endY + dir * HEADLAND_MARGIN_FT;
+    n += emitLineTo(out + n, maxOut - n, laneX, endY, laneX, headlandY, false, false);
+
+    // The turn is a pure sideways shift measured in the rover's own frame,
+    // so it flips sign on return passes: the next lane is to the rover's
+    // right going up the field and to its left coming back down.
+    float nextX = laneCenterX(i + 1, barWidthFt, overlapFraction);
+    float shift = (nextX - laneX) * cosf(turnRad(headingDeg));
+
+    TurnPlan p;
+    if (!planHeadlandTurn(shift, planLeft, planRight, p)) return n;
+    n += emitTurn(out + n, maxOut - n, p, laneX, headlandY, headingDeg);
   }
 
   return n;

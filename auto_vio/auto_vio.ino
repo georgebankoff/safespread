@@ -4,9 +4,14 @@
  * Position/heading come entirely from the SafeSpreadVIO iPhone app's ARKit
  * pose, sent as !P packets over BLE. No internal dead reckoning.
  *
- * Controls:
- *   '1' -> Start Autonomous Mission
- *   '2' -> Emergency Stop / Reset
+ * The route for the whole mission is computed once when Start is pressed and
+ * thereafter only followed. Nothing during the run re-decides where to go:
+ * tracking error steers the rover back onto the plan instead of producing a
+ * different plan, which is what made the earlier reactive version oscillate
+ * between maneuvers.
+ *
+ * Controls (from the app):
+ *   '1' -> Start    '2' -> Stop    '3' -> Self test    '4' -> Wet/Dry
  */
 
 #include <Wire.h>
@@ -33,7 +38,7 @@ const int PUMP_PIN  = 6;
 const int NEUTRAL_US       = 1500;
 const int THROTTLE_FWD_US  = 1620;
 const int THROTTLE_TURN_US = 1600;
-const int THROTTLE_REV_US  = 1380;  // reverse leg of the three-point turn
+const int THROTTLE_REV_US  = 1380;
 
 const int STEER_CENTER_US = 1500;
 const int STEER_LEFT_US   = 2390;
@@ -50,56 +55,40 @@ float fieldPassFt  = 21.91f;
 float fieldWidthFt = 21.91f;
 const unsigned long VIO_TIMEOUT_MS = 1000;
 
-const int MAX_LANES = 64;
-bool laneCovered[MAX_LANES];
-uint8_t laneAttempts[MAX_LANES];  // bounds retries so a bad lane cannot loop
-int totalLanes  = 0;
-int currentLane = 0;
+// The rover's two turning circles, measured 2026-08-26 with the sketch in
+// turn_radius/. They are not the same size -- the steering trim sits
+// off-centre -- and averaging them would ask for left turns tighter than the
+// rover can drive and right turns wider than it needs, so both are carried
+// separately all the way through the planner.
+//
+// Re-measure after any steering linkage or trim change: flash
+// turn_radius/turn_radius.ino, press Start, and copy the two numbers here.
+float turnRadiusLeftFt  = 4.33f;
+float turnRadiusRightFt = 2.92f;
 
 // Steering polarity: +1 means a pulse BELOW centre steers toward increasing
 // heading (clockwise / to the rover's right), matching STEER_RIGHT_US < centre.
-// Measured rather than assumed -- the first full-lock leg commands a known
-// direction, so comparing intent against the heading actually produced settles
-// it. Getting this backwards inverts every correction, which looks like
-// erratic wandering rather than an obvious fault.
+// Measured rather than assumed -- wiring the servo backwards inverts every
+// correction, which does not look like a fault, it looks like wandering.
 int  steerSign = 1;
 bool steerSignChecked = false;
-float polarityScore = 0.0f;      // + agrees with assumption, - disagrees
+float polarityScore = 0.0f;
 float polarityLastHeading = 0.0f;
 float polarityLastCommand = 0.0f;
 const float POLARITY_DECIDE_AT = 60.0f;
 
-
-// Full lock is ~700us from centre, so at the old 90us/ft a rover a whole foot
-// off its lane asked for barely a tenth of the available steering and could
-// not close that gap inside a short pass -- it just sprayed a diagonal. At
-// 250us/ft, a foot of error commands about a third of lock and ~2.8ft saturates.
-const float CROSS_TRACK_GAIN = 250.0f;  // us of steering per ft off the lane
-const float HEADING_GAIN     = 14.0f;   // us of steering per degree of error
 const float MAX_STEER_OFFSET = 700.0f;
 
-// Spray only while genuinely on the lane. Being inside the rectangle is not
-// enough: a pass crossing it diagonally is inside the whole way.
-const float SPRAY_ON_LANE_TOL_FT = 0.45f;
-
-const float PASS_END_TOL_FT   = 0.4f;
-const float ALIGN_TOL_FT      = 0.25f;
-const float ALIGN_HEADING_TOL = 12.0f;
-const unsigned long TURN_PHASE_TIMEOUT_MS = 6000;
-
-float turnStartHeading = 0.0f;
-unsigned long phaseStart = 0;
-
 // Course over ground: the direction the rover is actually travelling, taken
-// from successive positions rather than from which way the phone points.
-// Any constant yaw error in how the phone is mounted cancels out of this,
-// which it does not for the reported heading -- and with the phone's heading
-// a mounting error of a few degrees biases lane tracking in opposite
-// directions on outbound and return passes, striping the coverage.
+// from successive positions rather than from which way the phone points. Any
+// constant yaw error in how the phone is mounted cancels out of this, which it
+// does not for the reported heading -- and a mounting error of a few degrees
+// otherwise biases lane tracking in opposite directions on outbound and return
+// passes, striping the coverage.
 float prevSampleX = 0.0f, prevSampleY = 0.0f;
 float courseDeg = 0.0f;
 bool  courseValid = false;
-const float COURSE_MIN_STEP_FT = 0.20f;  // ignore jitter below real motion
+const float COURSE_MIN_STEP_FT = 0.20f;
 const float COURSE_SMOOTHING   = 0.35f;
 
 float robotX_ft    = 0.0f;
@@ -111,6 +100,60 @@ unsigned long lastTelemetryTime = 0;
 unsigned long packetCount = 0;
 bool dryRunMode  = false;
 bool sprayActive = false;
+
+Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
+BLECharacteristic *txCharacteristic = NULL;
+volatile bool bleConnected = false;
+
+enum AutoState { AUTO_IDLE, AUTO_FOLLOW, AUTO_COMPLETE };
+AutoState state = AUTO_IDLE;
+
+inline bool isNavigating() { return state == AUTO_FOLLOW; }
+
+const int MAX_ROUTE_POINTS = 2600;
+RoutePoint route[MAX_ROUTE_POINTS];
+int routeCount = 0;
+int routeIndex = 0;
+int firstPassEnd = 0;      // route index where the all-important first pass ends
+
+// Steer at a point this far ahead on the path. On a straight pass a long
+// lookahead tracks smoothly; through a turn it must be shorter than the arc's
+// radius or the rover simply cuts the corner and misses the maneuver.
+const float LOOKAHEAD_FT      = 2.5f;
+const float LOOKAHEAD_TURN_FT = 1.0f;
+const float PURSUIT_GAIN      = 16.0f;   // us of steering per degree of error
+const int   ROUTE_SEARCH_WINDOW = 80;
+const float CUSP_TOL_FT       = 0.5f;
+
+// An RC ESC will not change direction until it has seen neutral, so a
+// three-point turn has to pause briefly at each cusp.
+const unsigned long DIR_CHANGE_PAUSE_MS = 350;
+bool escReverse = false;
+unsigned long dirChangeAt = 0;
+
+// If the rover cannot reach the point it is tracking, skip past it rather than
+// grinding against it for the rest of the mission.
+const unsigned long STALL_TIMEOUT_MS = 8000;
+int lastRouteIndex = -1;
+unsigned long routeIndexSince = 0;
+
+// Spray while the plan says to, unless the rover is so far off the plan that
+// spraying would put brine somewhere it does not belong. The old test -- being
+// inside the rectangle -- cut spray off half a foot outside the first lane,
+// which sits on x=0, so the most important pass of the mission was the one
+// most likely to stop spraying.
+const float SPRAY_OFFPLAN_FT       = 1.5f;
+const float SPRAY_OFFPLAN_FIRST_FT = 3.0f;   // the first pass gets more rope
+const float SPRAY_HYSTERESIS_FT    = 0.5f;
+bool sprayInhibited = false;
+
+void bleLog(String msg) {
+  if (bleConnected && txCharacteristic != NULL) {
+    msg += "\n";
+    txCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
+    txCharacteristic->notify();
+  }
+}
 
 void resetCourse() {
   courseValid = false;
@@ -136,9 +179,8 @@ void updateCourse() {
 }
 
 // Correlate what we asked the steering to do against what the heading actually
-// did. Wiring the servo backwards inverts every correction, which does not look
-// like a fault -- it looks like the rover wandering -- so it is worth settling
-// from the data rather than trusting a constant.
+// did. Only meaningful driving forward: in reverse the same lock swings the
+// nose the other way, which would cancel the evidence out.
 void observeSteeringPolarity() {
   if (steerSignChecked) return;
 
@@ -148,7 +190,6 @@ void observeSteeringPolarity() {
   float cmd = polarityLastCommand;
   if (fabsf(cmd) < 150.0f || fabsf(turned) < 0.5f || fabsf(turned) > 30.0f) return;
 
-  // cmd > 0 asked for clockwise; agreement means the heading went that way.
   polarityScore += (cmd > 0.0f) == (turned > 0.0f) ? fabsf(turned) : -fabsf(turned);
 
   if (fabsf(polarityScore) >= POLARITY_DECIDE_AT) {
@@ -162,100 +203,12 @@ void observeSteeringPolarity() {
   }
 }
 
-Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
-BLECharacteristic *txCharacteristic = NULL;
-volatile bool bleConnected = false;
-
-// A car cannot translate sideways, so shifting one lane (~1.2 ft) between
-// passes needs a three-point turn rather than a waypoint beside the last one.
-// The route is planned once at Start and then only followed. Nothing during
-// the run may re-decide where to go: tracking error steers the rover back onto
-// the plan rather than producing a different plan, which is what made the old
-// reactive state machine oscillate between maneuvers.
-enum AutoState { AUTO_IDLE, AUTO_FOLLOW, AUTO_COMPLETE };
-AutoState state = AUTO_IDLE;
-
-inline bool isNavigating() { return state == AUTO_FOLLOW; }
-
-const int MAX_ROUTE_POINTS = 2200;
-RoutePoint route[MAX_ROUTE_POINTS];
-int routeCount = 0;
-int routeIndex = 0;
-
-// Steer at a point this far ahead on the path. Shorter tracks tighter but
-// weaves; longer is smoother but cuts corners.
-const float LOOKAHEAD_FT   = 2.5f;
-const float PURSUIT_GAIN   = 16.0f;  // us of steering per degree of bearing error
-const int   ROUTE_SEARCH_WINDOW = 80;
-
-// Turning circle, measured rather than assumed: a full-lock leg rotates by
-// (distance / radius), so one leg of the first turn gives the radius. With it
-// we can drive the turn a person would -- swing wide into a lane a few over
-// and pick up the skipped ones later -- and fall back to shuffling on the
-// spot only where a wide sweep genuinely will not fit.
-// Planning happens before the rover has moved, so it needs a radius up front.
-// This default is refined by measurement during the run and reported, so a
-// bad guess shows up as a log line rather than as mysterious behaviour.
-float turnRadiusFt = 4.0f;
-bool  radiusKnown  = false;
-bool  useWideTurn  = false;
-float legStartHeading = 0.0f;
-
-void chooseTurnStyle() {
-  // A wide 180 lands 2R to the side; it is only usable if that stays on the
-  // plot, otherwise the rover would swing clean off the area being covered.
-  useWideTurn = (2.0f * turnRadiusFt) <= (fieldWidthFt - BAR_WIDTH_FT);
-  bleLog("Turn radius ~" + String(turnRadiusFt, 1) + " ft (circle " +
-         String(2.0f * turnRadiusFt, 1) + " ft). Using " +
-         String(useWideTurn ? "wide sweeps." : "3-point turns: plot too narrow to sweep."));
-}
-
-// A full-lock arc sweeps sideways by the turning diameter -- several lane
-// widths, and wider than a small plot is across. So the 180 is done as a
-// sequence of short forward/reverse legs at opposite lock, which rotate the
-// rover while leaving it roughly where it started.
-// Longer legs mean fewer forward/reverse changes, and each change costs a
-// visible pause while the ESC passes through neutral to arm the other way.
-const float SHUFFLE_LEG_FT      = 2.0f;
-const float ROTATION_DONE_DEG   = 170.0f;
-// Run-up for lining onto a lane. Too short and the rover reaches the boundary
-// still off-line, which is what forced the diagonal passes.
-const float HEADLAND_MARGIN_FT  = 5.0f;
-const int   MAX_SHUFFLE_LEGS    = 16;
-const int   MAX_ALIGN_RETRIES   = 2;
-int alignRetries = 0;
-int targetLane = 0;
-
-bool turnRightward = true;
-int  shuffleLegs = 0;
-float legStartX = 0.0f, legStartY = 0.0f;
-
-inline float distanceFromLegStart() {
-  float dx = robotX_ft - legStartX;
-  float dy = robotY_ft - legStartY;
-  return sqrtf(dx * dx + dy * dy);
-}
-
-inline float rotationSoFar() {
-  return fabsf(angleDiffDeg(robotHeading, turnStartHeading));
-}
-
-// Lanes are no longer driven in index order: a full-lock 180 shifts sideways
-// by the turning diameter, which is many lane widths, so after each turn we
-// take whichever uncovered lane we actually ended up nearest. Direction of
-// travel therefore depends on which end of the lane we start from, not on
-// whether the lane index is odd or even.
-bool passGoesUp = true;
-inline float passTargetY()      { return passGoesUp ? fieldPassFt : 0.0f; }
-inline float passDesiredHeading(){ return passGoesUp ? 0.0f : 180.0f; }
-
 // PCA9685 registers. An I2C ACK only proves the chip is powered and
 // addressable; it says nothing about whether it is still configured.
 #define PCA_MODE1     0x00
 #define PCA_PRESCALE  0xFE
 #define PCA_SLEEP_BIT 0x10
-// 25MHz / (4096 * 50Hz) - 1
-#define PCA_EXPECTED_PRESCALE 121
+#define PCA_EXPECTED_PRESCALE 121   // 25MHz / (4096 * 50Hz) - 1
 
 int lastSteerUs = STEER_CENTER_US;
 int lastEscUs   = NEUTRAL_US;
@@ -280,13 +233,12 @@ uint8_t readPcaRegister(uint8_t reg) {
 // A brownout -- typically the steering servo stalling and sagging the rail --
 // resets the PCA9685 into its power-on state: asleep, prescaler unset, all
 // outputs dead. The ESP32 rides through on its own decoupling and never
-// notices, so the sketch keeps sending pulses to a chip that is ignoring
-// them. Detect that and reconfigure instead of assuming setup() still holds.
+// notices, so the sketch keeps sending pulses to a chip that is ignoring them.
 bool ensurePwmReady() {
   uint8_t mode1 = readPcaRegister(PCA_MODE1);
   uint8_t prescale = readPcaRegister(PCA_PRESCALE);
 
-  if (mode1 == 0xFF && prescale == 0xFF) return false;  // not reachable at all
+  if (mode1 == 0xFF && prescale == 0xFF) return false;
 
   bool asleep = (mode1 & PCA_SLEEP_BIT) != 0;
   bool wrongRate = abs((int)prescale - PCA_EXPECTED_PRESCALE) > 3;
@@ -298,14 +250,13 @@ bool ensurePwmReady() {
   pwm.begin();
   pwm.setPWMFreq(50);
   delay(10);
-  // Restore whatever was last commanded so recovery is not a jolt.
   setChannelPulse(STEER_CH, lastSteerUs);
   setChannelPulse(ESC_CH, lastEscUs);
   return true;
 }
 
-// In dry-run mode the spray state is still tracked and reported so the app
-// can show where it *would* have sprayed, but no hardware is energised.
+// In dry-run mode the spray state is still tracked and reported so the app can
+// show where it *would* have sprayed, but no hardware is energised.
 void setSpray(bool on) {
   if (sprayActive != on) {
     sprayActive = on;
@@ -327,34 +278,17 @@ void stopDrive() {
   setChannelPulse(STEER_CH, STEER_CENTER_US);
 }
 
-// Log to the app only. Serial is intentionally not used here: in the field
-// there is no laptop attached, and everything below is mirrored in the app's
-// rover panel. See setup() for the one boot-time exception.
-void bleLog(String msg) {
-  if (bleConnected && txCharacteristic != NULL) {
-    msg += "\n";
-    txCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
-    txCharacteristic->notify();
-  }
-}
-
-void regenerateLanes() {
-  totalLanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
-  if (totalLanes > MAX_LANES) totalLanes = MAX_LANES;
-  currentLane = 0;
-  for (int i = 0; i < MAX_LANES; i++) { laneCovered[i] = false; laneAttempts[i] = 0; }
-  float covered = laneCenterX(totalLanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
+void announceArea() {
+  int lanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  float covered = laneCenterX(lanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
                   BAR_WIDTH_FT * 0.5f;
   bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
-         " ft -> " + String(totalLanes) + " lanes, covering " +
+         " ft -> " + String(lanes) + " lanes, covering " +
          String(covered, 1) + " ft of width.");
-  // A plot that fitted a wide sweep may not once resized, and vice versa.
-  if (radiusKnown) chooseTurnStyle();
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
-// without reflashing. Throttle stays at neutral throughout -- this only
-// exercises steering, never drives the motor.
+// without reflashing. Throttle stays at neutral throughout.
 void runSelfTest() {
   bleLog("=== SELF TEST ===");
 
@@ -377,8 +311,6 @@ void runSelfTest() {
 
   bleLog("[PASS] I2C OK (PCA9685 @ 0x40)");
 
-  // Addressable is not the same as configured: report the registers that
-  // actually decide whether pulses come out.
   uint8_t mode1 = readPcaRegister(PCA_MODE1);
   uint8_t prescale = readPcaRegister(PCA_PRESCALE);
   bool asleep = (mode1 & PCA_SLEEP_BIT) != 0;
@@ -431,40 +363,67 @@ void steerRightward(float rightward) {
   setChannelPulse(STEER_CH, constrain(us, STEER_RIGHT_US, STEER_LEFT_US));
 }
 
-// Hold the lane line: combine how far off the line we are with how far off
-// the lane heading we are. Cross-track sign flips on return passes because
-// +X lies to the rover's left when it is heading back down the field.
-void holdLane(float laneX, float desiredHeading, bool goingUp) {
-  float crossErr = laneX - robotX_ft;
-  float crossTerm = (goingUp ? 1.0f : -1.0f) * CROSS_TRACK_GAIN * crossErr;
-
-  // Prefer measured course while it is trustworthy, so the phone's mounting
-  // angle drops out; fall back to reported heading when barely moving.
-  float reference = courseValid ? courseDeg : robotHeading;
-  float headingTerm = HEADING_GAIN * angleDiffDeg(desiredHeading, reference);
-
-  steerRightward(crossTerm + headingTerm);
-}
-
-bool insideField() {
-  return robotY_ft >= 0.0f && robotY_ft <= fieldPassFt &&
-         robotX_ft >= -0.5f && robotX_ft <= fieldWidthFt + 0.5f;
-}
-
 void planRoute() {
   routeCount = buildRoute(fieldPassFt, fieldWidthFt, BAR_WIDTH_FT,
-                          LANE_OVERLAP_FRACTION, turnRadiusFt,
+                          LANE_OVERLAP_FRACTION,
+                          turnRadiusLeftFt, turnRadiusRightFt,
                           route, MAX_ROUTE_POINTS);
   routeIndex = 0;
+  lastRouteIndex = -1;
+  sprayInhibited = false;
+  escReverse = false;
+  dirChangeAt = millis();
+
+  // Where the first pass ends, so it can be given more latitude before spray
+  // is cut. It is the pass everything else is lined up against.
+  firstPassEnd = routeCount;
+  for (int i = 0; i < routeCount; i++) {
+    if (!route[i].spray) { firstPassEnd = i; break; }
+  }
 
   int lanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
-  int skip = laneSkipFor(turnRadiusFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION, lanes);
+  int reversals = 0;
+  float minY = 0.0f, maxY = 0.0f, minX = 0.0f, maxX = 0.0f;
+  for (int i = 0; i < routeCount; i++) {
+    if (i > 0 && route[i].reverse != route[i - 1].reverse) reversals++;
+    if (route[i].x < minX) minX = route[i].x;
+    if (route[i].x > maxX) maxX = route[i].x;
+    if (route[i].y < minY) minY = route[i].y;
+    if (route[i].y > maxY) maxY = route[i].y;
+  }
 
   bleLog("Planned " + String(routeCount) + " pts, " + String(lanes) +
-         " lanes, skip " + String(skip) + ", R=" + String(turnRadiusFt, 1) + " ft");
+         " lanes, " + String(reversals) + " direction changes.");
+  bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
+         String(turnRadiusRightFt, 2) + " ft.");
+  bleLog("Needs clear ground " + String(maxY - fieldPassFt, 1) + " ft past the far end, " +
+         String(-minY, 1) + " ft behind the start.");
+
   if (routeCount >= MAX_ROUTE_POINTS) {
     bleLog("!! Route hit the point limit; area is too large to plan fully.");
   }
+}
+
+void updateSpray() {
+  const RoutePoint &p = route[routeIndex];
+  if (!p.spray) {
+    sprayInhibited = false;
+    setSpray(false);
+    return;
+  }
+
+  float dx = p.x - robotX_ft, dy = p.y - robotY_ft;
+  float off = sqrtf(dx * dx + dy * dy);
+  float limit = (routeIndex < firstPassEnd) ? SPRAY_OFFPLAN_FIRST_FT : SPRAY_OFFPLAN_FT;
+
+  if (sprayInhibited) {
+    if (off < limit - SPRAY_HYSTERESIS_FT) sprayInhibited = false;
+  } else if (off > limit) {
+    sprayInhibited = true;
+    bleLog("!! " + String(off, 1) + " ft off plan -- spray paused.");
+  }
+
+  setSpray(!sprayInhibited);
 }
 
 // Pure pursuit: aim at a point a fixed distance ahead on the plan. Drift moves
@@ -477,8 +436,21 @@ void runFollow() {
     return;
   }
 
-  routeIndex = nearestRouteIndex(route, routeCount, routeIndex,
-                                 robotX_ft, robotY_ft, ROUTE_SEARCH_WINDOW);
+  routeIndex = advanceRouteIndex(route, routeCount, routeIndex,
+                                 robotX_ft, robotY_ft,
+                                 ROUTE_SEARCH_WINDOW, CUSP_TOL_FT);
+
+  // A point it cannot reach must not hold up the rest of the mission.
+  if (routeIndex == lastRouteIndex) {
+    if (millis() - routeIndexSince > STALL_TIMEOUT_MS && routeIndex + 1 < routeCount) {
+      routeIndex++;
+      routeIndexSince = millis();
+      bleLog("!! Stuck at point " + String(lastRouteIndex) + "; skipping ahead.");
+    }
+  } else {
+    lastRouteIndex = routeIndex;
+    routeIndexSince = millis();
+  }
 
   if (routeIndex >= routeCount - 2) {
     setSpray(false);
@@ -488,28 +460,55 @@ void runFollow() {
     return;
   }
 
-  int la = lookaheadRouteIndex(route, routeCount, routeIndex,
-                               robotX_ft, robotY_ft, LOOKAHEAD_FT);
+  bool reversing = route[routeIndex].reverse;
+  if (reversing != escReverse) {
+    escReverse = reversing;
+    dirChangeAt = millis();
+  }
 
-  float dx = route[la].x - robotX_ft;
-  float dy = route[la].y - robotY_ft;
-  float want = bearingToWaypointDeg(dx, dy);
+  int la = lookaheadWithinSegment(route, routeCount, routeIndex,
+                                  robotX_ft, robotY_ft,
+                                  route[routeIndex].turning ? LOOKAHEAD_TURN_FT
+                                                            : LOOKAHEAD_FT);
 
-  // Course over ground where available, so how the phone is mounted does not
-  // bias the steering; reported heading when too slow to measure it.
-  float reference = courseValid ? courseDeg : robotHeading;
+  float want = bearingToWaypointDeg(route[la].x - robotX_ft,
+                                    route[la].y - robotY_ft);
+
+  // Backing up, the rover travels in the direction opposite its nose. Course
+  // over ground is preferred going forward, where it cancels out any error in
+  // how the phone is mounted; reverse legs are short enough that the reported
+  // heading is good enough.
+  float reference;
+  if (reversing) {
+    reference = fmodf(robotHeading + 180.0f, 360.0f);
+  } else {
+    reference = courseValid ? courseDeg : robotHeading;
+  }
+
   float err = angleDiffDeg(want, reference);
-
   float command = err * PURSUIT_GAIN;
-  observeSteeringPolarity();
-  polarityLastCommand = command;
 
-  steerRightward(command);
-  setChannelPulse(ESC_CH, fabsf(err) > 45.0f ? THROTTLE_TURN_US : THROTTLE_FWD_US);
+  // Steering acts on the direction of travel the opposite way in reverse:
+  // right lock swings the nose left, so the same command turns the rover's
+  // path the other way.
+  steerRightward(reversing ? -command : command);
 
-  // The plan says where spraying belongs; the bounds check is a backstop in
-  // case tracking error has carried the rover off the rectangle.
-  setSpray(route[routeIndex].spray && insideField());
+  if (!reversing) {
+    observeSteeringPolarity();
+    polarityLastCommand = command;
+  } else {
+    polarityLastHeading = robotHeading;   // don't let a reverse leg pollute it
+  }
+
+  if (millis() - dirChangeAt < DIR_CHANGE_PAUSE_MS) {
+    setChannelPulse(ESC_CH, NEUTRAL_US);   // let the ESC re-arm
+  } else if (reversing) {
+    setChannelPulse(ESC_CH, THROTTLE_REV_US);
+  } else {
+    setChannelPulse(ESC_CH, fabsf(err) > 45.0f ? THROTTLE_TURN_US : THROTTLE_FWD_US);
+  }
+
+  updateSpray();
 }
 
 #define QSLOTS 16
@@ -535,7 +534,7 @@ void feed(const uint8_t *d, size_t n) {
     if (d[0] == '1') {
       // Refused while running: the app re-zeros its VIO origin when Start is
       // pressed, so accepting a restart mid-drive would leave the rover
-      // navigating old waypoints in a newly-shifted coordinate frame.
+      // navigating an old plan in a newly-shifted coordinate frame.
       if (isNavigating()) {
         bleLog("!! Already running. Press Stop first.");
       } else {
@@ -565,7 +564,7 @@ void feed(const uint8_t *d, size_t n) {
         bleLog("!! Mode change refused: stop the mission first.");
       } else {
         dryRunMode = !dryRunMode;
-        setSpray(false);  // never leave hardware energised across a mode change
+        setSpray(false);
         bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
       }
     }
@@ -581,16 +580,16 @@ void feed(const uint8_t *d, size_t n) {
   while (accLen - i >= 11) {
     if (acc[i] != '!') { i++; continue; }
 
-    float n, m;  // N = pass length, M = width, in the app's input order
-    if (parseAreaPacket(&acc[i], accLen - i, n, m)) {
+    float np, mp;  // N = pass length, M = width, in the app's input order
+    if (parseAreaPacket(&acc[i], accLen - i, np, mp)) {
       if (isNavigating()) {
         bleLog("!! Area change refused while navigating.");
-      } else if (n > 0.5f && m > 0.5f && n < 500.0f && m < 500.0f) {
-        fieldPassFt = n;
-        fieldWidthFt = m;
-        regenerateLanes();
+      } else if (np > 0.5f && mp > 0.5f && np < 500.0f && mp < 500.0f) {
+        fieldPassFt = np;
+        fieldWidthFt = mp;
+        announceArea();
       } else {
-        bleLog("!! Rejected implausible area: " + String(n, 1) + " x " + String(m, 1));
+        bleLog("!! Rejected implausible area: " + String(np, 1) + " x " + String(mp, 1));
       }
       i += 11;
       continue;
@@ -605,8 +604,8 @@ void feed(const uint8_t *d, size_t n) {
       vioActive = true;
       lastVioTime = millis();
       packetCount++;
-      // Only meaningful while driving forward, so leave it alone mid-turn.
-      if (state == AUTO_FOLLOW) updateCourse();
+      // Course over ground is only meaningful driving forward.
+      if (state == AUTO_FOLLOW && !escReverse) updateCourse();
       i += 15;
     } else {
       i++;
@@ -629,8 +628,9 @@ class ServerCallbacks : public BLEServerCallbacks {
     bleLog("VIO app connected.");
     // Re-announce state so a freshly connected app isn't showing stale UI,
     // and because these were generated at boot with nobody listening.
-    bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
-           " ft -> " + String(totalLanes) + " lanes.");
+    announceArea();
+    bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
+           String(turnRadiusRightFt, 2) + " ft.");
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
   }
@@ -658,7 +658,7 @@ void setup() {
   delay(50);
   stopDrive();
 
-  regenerateLanes();
+  announceArea();
 
   BLEDevice::init("SafeSpread");
   BLEServer *server = BLEDevice::createServer();
@@ -676,8 +676,8 @@ void setup() {
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
 
-  // The only serial output that remains. Everything else goes to the app,
-  // but if the board never reaches this line -- or the app cannot connect --
+  // The only serial output that remains. Everything else goes to the app, but
+  // if the board never reaches this line -- or the app cannot connect --
   // serial is the sole remaining way to tell a hung board from a BLE problem.
   Serial.println("VIO Waypoint Navigator ready. Logging to app from here.");
 }
@@ -699,8 +699,8 @@ void loop() {
   if (millis() - lastTelemetryTime >= 1000) {
     lastTelemetryTime = millis();
     String phase = "IDLE";
-    if (state == AUTO_FOLLOW)         phase = "RUN";
-    else if (state == AUTO_COMPLETE)   phase = "DONE";
+    if (state == AUTO_FOLLOW)        phase = escReverse ? "REV" : "RUN";
+    else if (state == AUTO_COMPLETE) phase = "DONE";
 
     bleLog("[TLM] " + phase +
            " vio=" + String(vioActive ? "OK" : "NONE") +
