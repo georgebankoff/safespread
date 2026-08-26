@@ -1,5 +1,13 @@
-import React, { useEffect, useState } from 'react';
-import { Keyboard, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Keyboard,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
 
@@ -11,6 +19,9 @@ export default function App() {
   const [widthText, setWidthText] = useState('21.9');
   const [lengthText, setLengthText] = useState('21.9');
   const [areaNote, setAreaNote] = useState('');
+  const [telemetry, setTelemetry] = useState('');
+  const [log, setLog] = useState<string[]>([]);
+  const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
     Keyboard.dismiss();
@@ -25,7 +36,16 @@ export default function App() {
   };
 
   useEffect(() => {
-    ble.connect(setStatus).catch(() => {});
+    const handleLog = (line: string) => {
+      // Telemetry is a once-per-second heartbeat; pin it rather than letting
+      // it scroll the interesting mission messages away.
+      if (line.startsWith('[TLM]')) {
+        setTelemetry(line.slice(5).trim());
+      } else {
+        setLog((prev) => [...prev.slice(-40), line]);
+      }
+    };
+    ble.connect(setStatus, handleLog).catch(() => {});
     return () => {
       ble.disconnect();
     };
@@ -79,6 +99,22 @@ export default function App() {
           </Pressable>
         </View>
         {areaNote ? <Text style={styles.note}>{areaNote}</Text> : null}
+      </View>
+
+      <View style={styles.roverPanel}>
+        <Text style={styles.label}>Rover</Text>
+        <Text style={styles.telemetry}>{telemetry || 'no telemetry yet'}</Text>
+        <ScrollView
+          style={styles.logScroll}
+          ref={logRef}
+          onContentSizeChange={() => logRef.current?.scrollToEnd({ animated: false })}
+        >
+          {log.map((line, idx) => (
+            <Text key={idx} style={styles.logLine}>
+              {line}
+            </Text>
+          ))}
+        </ScrollView>
       </View>
       <View style={styles.buttons}>
         <Pressable
@@ -145,6 +181,24 @@ const styles = StyleSheet.create({
     marginLeft: 10,
   },
   note: { color: '#9ecbff', fontSize: 13, marginTop: 8 },
+  roverPanel: {
+    position: 'absolute',
+    top: 330,
+    bottom: 120,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    padding: 12,
+    borderRadius: 8,
+  },
+  telemetry: {
+    color: '#7fffa0',
+    fontSize: 13,
+    fontFamily: 'Menlo',
+    marginBottom: 8,
+  },
+  logScroll: { flex: 1 },
+  logLine: { color: '#ddd', fontSize: 12, fontFamily: 'Menlo', marginBottom: 2 },
   text: { color: 'white', fontSize: 18, fontWeight: '600' },
   buttons: {
     position: 'absolute',

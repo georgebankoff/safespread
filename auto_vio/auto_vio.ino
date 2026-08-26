@@ -340,12 +340,13 @@ void loop() {
   // packets arriving" from "packets fine, navigation misbehaving".
   if (millis() - lastTelemetryTime >= 1000) {
     lastTelemetryTime = millis();
-    Serial.println("[TLM] state=" + String((int)state) +
-                   " vio=" + String(vioActive ? "OK" : "NONE") +
-                   " pkts=" + String(packetCount) +
-                   " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
-                   " hdg=" + String(robotHeading, 0) +
-                   " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount));
+    bleLog("[TLM] " + String(state == AUTO_NAVIGATING ? "RUN" :
+                             (state == AUTO_COMPLETE ? "DONE" : "IDLE")) +
+           " vio=" + String(vioActive ? "OK" : "NONE") +
+           " pkts=" + String(packetCount) +
+           " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
+           " hdg=" + String(robotHeading, 0) +
+           " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount));
   }
 
   if (vioActive && (millis() - lastVioTime > VIO_TIMEOUT_MS)) {
