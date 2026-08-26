@@ -6,20 +6,27 @@
 static void laneGeometryTests() {
   const float BAR = 2.0f;
 
-  // 10ft wide, 2ft bar, no overlap -> 5 lanes tiling 0..10 exactly.
-  assert(laneCount(10.0f, BAR, 0.0f) == 5);
-  assert(fabsf(laneCenterX(0, BAR, 0.0f) - 1.0f) < 0.001f);
-  assert(fabsf(laneCenterX(4, BAR, 0.0f) - 9.0f) < 0.001f);
+  // The first lane must be exactly where the rover starts, so pressing Start
+  // drives straight ahead instead of steering onto an offset lane.
+  assert(fabsf(laneCenterX(0, BAR, 0.0f)) < 0.001f);
+  assert(fabsf(laneCenterX(0, 17.0f / 12.0f, 0.15f)) < 0.001f);
 
-  // Sprayed band must stay inside the rectangle on both edges.
+  // 10ft wide, 2ft bar, no overlap -> 5 lanes at 0,2,4,6,8.
+  assert(laneCount(10.0f, BAR, 0.0f) == 5);
+  assert(fabsf(laneCenterX(4, BAR, 0.0f) - 8.0f) < 0.001f);
+
+  // Total sprayed band never exceeds the requested width.
   int n = laneCount(10.0f, BAR, 0.0f);
-  assert(laneCenterX(0, BAR, 0.0f) - BAR / 2 >= -0.001f);
-  assert(laneCenterX(n - 1, BAR, 0.0f) + BAR / 2 <= 10.0f + 0.001f);
+  float band = (laneCenterX(n - 1, BAR, 0.0f) + BAR / 2) -
+               (laneCenterX(0, BAR, 0.0f) - BAR / 2);
+  assert(band <= 10.0f + 0.001f);
 
   // Width not divisible by the bar: cover as much as fits, never overrun.
   int m = laneCount(9.0f, BAR, 0.0f);
   assert(m == 4);
-  assert(laneCenterX(m - 1, BAR, 0.0f) + BAR / 2 <= 9.0f + 0.001f);
+  float band9 = (laneCenterX(m - 1, BAR, 0.0f) + BAR / 2) -
+                (laneCenterX(0, BAR, 0.0f) - BAR / 2);
+  assert(band9 <= 9.0f + 0.001f);
 
   // Narrower than the bar still yields one pass rather than zero.
   assert(laneCount(1.0f, BAR, 0.0f) == 1);
@@ -28,9 +35,13 @@ static void laneGeometryTests() {
   const float REALBAR = 17.0f / 12.0f;
   int r = laneCount(21.91f, REALBAR, 0.15f);
   assert(r >= 2);
-  assert(laneCenterX(r - 1, REALBAR, 0.15f) + REALBAR / 2 <= 21.91f + 0.001f);
-  // and the next lane would have overrun, i.e. we did not stop early
-  assert(laneCenterX(r, REALBAR, 0.15f) + REALBAR / 2 > 21.91f);
+  float bandR = (laneCenterX(r - 1, REALBAR, 0.15f) + REALBAR / 2) -
+                (laneCenterX(0, REALBAR, 0.15f) - REALBAR / 2);
+  assert(bandR <= 21.91f + 0.001f);
+  // and one more lane would have overrun, i.e. we did not stop early
+  float bandR1 = (laneCenterX(r, REALBAR, 0.15f) + REALBAR / 2) -
+                 (laneCenterX(0, REALBAR, 0.15f) - REALBAR / 2);
+  assert(bandR1 > 21.91f);
 
   printf("lane geometry: passed (10ft=%d lanes, 9ft=%d, real=%d)\n", n, m, r);
 }

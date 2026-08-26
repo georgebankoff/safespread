@@ -33,9 +33,12 @@ inline bool parseAreaPacket(const uint8_t* d, size_t n, float& widthFt, float& l
 
 // --- Lane geometry -------------------------------------------------------
 // Lanes are spaced so the spray bar tiles the width with a little overlap.
-// The first lane is half a bar-width in from the edge, so the sprayed band
-// starts exactly at x=0 and never spills past the far edge: an area not
-// divisible by the bar width is under-covered at the far side, never over.
+// The first lane sits at x=0, i.e. exactly where the rover is standing when
+// the mission starts: placing the rover is how you aim the first pass, and it
+// must therefore drive straight ahead rather than immediately steering onto a
+// lane offset from it. Coverage consequently begins half a bar-width to the
+// left of the start point. Lanes stop before the far edge, so a width not
+// divisible by the bar is under-covered at the far side, never overrun.
 
 inline float laneSpacing(float barWidthFt, float overlapFraction) {
   float s = barWidthFt * (1.0f - overlapFraction);
@@ -43,7 +46,7 @@ inline float laneSpacing(float barWidthFt, float overlapFraction) {
 }
 
 inline float laneCenterX(int lane, float barWidthFt, float overlapFraction) {
-  return barWidthFt * 0.5f + lane * laneSpacing(barWidthFt, overlapFraction);
+  return lane * laneSpacing(barWidthFt, overlapFraction);
 }
 
 inline int laneCount(float widthFt, float barWidthFt, float overlapFraction) {
