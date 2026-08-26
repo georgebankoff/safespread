@@ -18,20 +18,33 @@ inline bool parsePosePacket(const uint8_t* d, size_t n, float& x, float& y, floa
   return true;
 }
 
+// 11-byte '!D' packet: field dimensions in feet, set from the app.
+inline bool parseAreaPacket(const uint8_t* d, size_t n, float& widthFt, float& lengthFt) {
+  if (n < 11 || d[0] != 0x21 || d[1] != 0x44) return false;
+
+  uint8_t sum = 0;
+  for (int i = 0; i < 10; i++) sum += d[i];
+  if ((uint8_t)(~sum) != d[10]) return false;
+
+  memcpy(&widthFt, d + 2, 4);
+  memcpy(&lengthFt, d + 6, 4);
+  return true;
+}
+
 struct Waypoint {
   float x;
   float y;
 };
 
-inline int buildWaypoints(float fieldSideFt, float barWidthFt, float overlapFraction,
-                           Waypoint* out, int maxOut) {
+inline int buildWaypoints(float widthFt, float lengthFt, float barWidthFt,
+                           float overlapFraction, Waypoint* out, int maxOut) {
   float spacingTarget = barWidthFt * (1.0f - overlapFraction);
-  int lanes = (int)ceilf(fieldSideFt / spacingTarget) + 1;
+  int lanes = (int)ceilf(widthFt / spacingTarget) + 1;
   if (lanes < 2) lanes = 2;
-  float spacing = fieldSideFt / (float)(lanes - 1);
+  float spacing = widthFt / (float)(lanes - 1);
 
   auto endY = [&](int lane) -> float {
-    return (lane % 2 == 0) ? fieldSideFt : 0.0f;
+    return (lane % 2 == 0) ? lengthFt : 0.0f;
   };
 
   int idx = 0;

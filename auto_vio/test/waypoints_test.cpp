@@ -4,9 +4,9 @@
 #include "../nav_math.h"
 
 int main() {
-  // Clean round-number case: field 10ft, bar 2ft, no overlap margin.
+  // Clean round-number case: 10ft x 10ft field, bar 2ft, no overlap margin.
   Waypoint wp[32];
-  int count = buildWaypoints(10.0f, 2.0f, 0.0f, wp, 32);
+  int count = buildWaypoints(10.0f, 10.0f, 2.0f, 0.0f, wp, 32);
 
   Waypoint expected[] = {
     {0, 10}, {2, 10}, {2, 0}, {4, 0}, {4, 10},
@@ -24,7 +24,7 @@ int main() {
   const float FIELD = 21.91f;
   const float BAR = 17.0f / 12.0f;
   Waypoint real[64];
-  int realCount = buildWaypoints(FIELD, BAR, 0.15f, real, 64);
+  int realCount = buildWaypoints(FIELD, FIELD, BAR, 0.15f, real, 64);
   assert(realCount > 0);
   assert(fabsf(real[0].x - 0.0f) < 0.01f);
   assert(fabsf(real[realCount - 1].x - FIELD) < 0.01f);
@@ -40,7 +40,15 @@ int main() {
     }
   }
 
-  printf("waypoints_test: all assertions passed (round-number count=%d, real-world count=%d)\n",
-         count, realCount);
+  // Rectangular field: lanes span the width, passes run the length.
+  Waypoint rect[64];
+  int rectCount = buildWaypoints(6.0f, 20.0f, 2.0f, 0.0f, rect, 64);
+  assert(rectCount > 0);
+  assert(fabsf(rect[0].x - 0.0f) < 0.01f);
+  assert(fabsf(rect[0].y - 20.0f) < 0.01f);          // first pass runs the length
+  assert(fabsf(rect[rectCount - 1].x - 6.0f) < 0.01f); // last lane reaches the width
+
+  printf("waypoints_test: all assertions passed (round=%d, real=%d, rect=%d)\n",
+         count, realCount, rectCount);
   return 0;
 }

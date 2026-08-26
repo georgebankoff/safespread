@@ -1,6 +1,6 @@
 import { BleManager, Device } from 'react-native-ble-plx';
 import { Buffer } from 'buffer';
-import { buildPosePacket } from './protocol';
+import { buildAreaPacket, buildPosePacket } from './protocol';
 
 const DEVICE_NAME = 'SafeSpread';
 const NUS_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
@@ -53,6 +53,16 @@ export class SafeSpreadBLE {
   async sendPose(x: number, y: number, heading: number): Promise<void> {
     if (!this.device) return;
     const packet = buildPosePacket(x, y, heading);
+    await this.device.writeCharacteristicWithoutResponseForService(
+      NUS_SERVICE_UUID,
+      NUS_TX_UUID,
+      Buffer.from(packet).toString('base64')
+    );
+  }
+
+  async sendArea(widthFt: number, lengthFt: number): Promise<void> {
+    if (!this.device) return;
+    const packet = buildAreaPacket(widthFt, lengthFt);
     await this.device.writeCharacteristicWithoutResponseForService(
       NUS_SERVICE_UUID,
       NUS_TX_UUID,

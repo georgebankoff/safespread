@@ -38,6 +38,32 @@ int main() {
   badHeader[1] = 'X';
   assert(!parsePosePacket(badHeader, sizeof(badHeader), x, y, heading));
 
+  // --- !D area packet ---
+  uint8_t area[11];
+  area[0] = 0x21;
+  area[1] = 0x44;
+  float w = 30.0f, l = 16.5f;
+  memcpy(area + 2, &w, 4);
+  memcpy(area + 6, &l, 4);
+  uint8_t asum = 0;
+  for (int i = 0; i < 10; i++) asum += area[i];
+  area[10] = (uint8_t)(~asum);
+
+  float gotW = 0, gotL = 0;
+  assert(parseAreaPacket(area, sizeof(area), gotW, gotL));
+  assert(gotW == 30.0f);
+  assert(gotL == 16.5f);
+
+  uint8_t areaBad[11];
+  memcpy(areaBad, area, 11);
+  areaBad[10] ^= 0xFF;
+  assert(!parseAreaPacket(areaBad, sizeof(areaBad), gotW, gotL));
+
+  assert(!parseAreaPacket(area, 10, gotW, gotL));
+
+  // A pose packet must not be mistaken for an area packet.
+  assert(!parseAreaPacket(packet, sizeof(packet), gotW, gotL));
+
   printf("parse_test: all assertions passed\n");
   return 0;
 }

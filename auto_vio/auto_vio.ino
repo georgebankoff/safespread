@@ -39,7 +39,10 @@ const int STEER_RIGHT_US  = 700;
 
 const float BAR_WIDTH_FT          = 17.0f / 12.0f;
 const float LANE_OVERLAP_FRACTION = 0.15f;
-const float FIELD_SIDE_FT         = 21.91f;
+
+// Defaults (480 sqft square); overridable at runtime from the app via '!D'.
+float fieldWidthFt  = 21.91f;
+float fieldLengthFt = 21.91f;
 const float WAYPOINT_TOLERANCE_FT = 0.5f;
 const unsigned long VIO_TIMEOUT_MS = 1000;
 
@@ -86,6 +89,18 @@ void bleLog(String msg) {
     msg += "\n";
     txCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
     txCharacteristic->notify();
+  }
+}
+
+void regenerateWaypoints() {
+  waypointCount = buildWaypoints(fieldWidthFt, fieldLengthFt, BAR_WIDTH_FT,
+                                  LANE_OVERLAP_FRACTION, waypoints, MAX_WAYPOINTS);
+  currentWaypointIndex = 0;
+  bleLog("Area " + String(fieldWidthFt, 1) + " x " + String(fieldLengthFt, 1) +
+         " ft (" + String(fieldWidthFt * fieldLengthFt, 0) + " sqft) -> " +
+         String(waypointCount) + " waypoints.");
+  if (waypointCount >= MAX_WAYPOINTS) {
+    bleLog("!! Area too large for waypoint buffer; coverage will be incomplete.");
   }
 }
 
@@ -222,8 +237,25 @@ void feed(const uint8_t *d, size_t n) {
   }
 
   size_t i = 0;
-  while (accLen - i >= 15) {
+  while (accLen - i >= 11) {
     if (acc[i] != '!') { i++; continue; }
+
+    float w, l;
+    if (parseAreaPacket(&acc[i], accLen - i, w, l)) {
+      if (state == AUTO_NAVIGATING) {
+        bleLog("!! Area change refused while navigating.");
+      } else if (w > 0.5f && l > 0.5f && w < 500.0f && l < 500.0f) {
+        fieldWidthFt = w;
+        fieldLengthFt = l;
+        regenerateWaypoints();
+      } else {
+        bleLog("!! Rejected implausible area: " + String(w, 1) + " x " + String(l, 1));
+      }
+      i += 11;
+      continue;
+    }
+
+    if (accLen - i < 15) { i++; continue; }
     float x, y, heading;
     if (parsePosePacket(&acc[i], accLen - i, x, y, heading)) {
       robotX_ft = x;
@@ -277,9 +309,7 @@ void setup() {
   delay(50);
   stopDrive();
 
-  waypointCount = buildWaypoints(FIELD_SIDE_FT, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION,
-                                  waypoints, MAX_WAYPOINTS);
-  Serial.println("Built " + String(waypointCount) + " waypoints.");
+  regenerateWaypoints();
 
   BLEDevice::init("SafeSpread");
   BLEServer *server = BLEDevice::createServer();
