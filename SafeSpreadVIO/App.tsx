@@ -24,6 +24,7 @@ export default function App() {
   const [dryRun, setDryRun] = useState(false);
   const [spraying, setSpraying] = useState(false);
   const [running, setRunning] = useState(false);
+  const [sentCount, setSentCount] = useState(0);
   const logRef = useRef<ScrollView>(null);
 
   const applyArea = () => {
@@ -60,14 +61,22 @@ export default function App() {
     };
   }, []);
 
+  // Read through refs, and depend on nothing: `pose` is a fresh object every
+  // ARKit frame (~60Hz), so listing it here would clear and recreate the
+  // interval every ~16ms and the 100ms tick would never once fire.
+  const sendStateRef = useRef({ pose, status, trackingOk });
+  sendStateRef.current = { pose, status, trackingOk };
+
   useEffect(() => {
     const timer = setInterval(() => {
-      if (status === 'connected' && trackingOk) {
-        ble.sendPose(pose.x, pose.y, pose.heading);
+      const current = sendStateRef.current;
+      if (current.status === 'connected' && current.trackingOk) {
+        ble.sendPose(current.pose.x, current.pose.y, current.pose.heading);
+        setSentCount((n) => n + 1);
       }
     }, 100);
     return () => clearInterval(timer);
-  }, [status, trackingOk, pose]);
+  }, []);
 
   return (
     <View style={[styles.container, spraying && styles.containerSpraying]}>
@@ -80,6 +89,7 @@ export default function App() {
           Tracking: {trackingState}
           {trackingOk ? '' : ' (not sending)'}
         </Text>
+        <Text style={styles.text}>Sent: {sentCount}</Text>
       </View>
 
       <View style={styles.areaPanel}>
