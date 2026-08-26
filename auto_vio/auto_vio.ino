@@ -175,6 +175,14 @@ const float SPRAY_OFFPLAN_FIRST_FT = 3.0f;   // the first pass gets more rope
 const float SPRAY_HYSTERESIS_FT    = 0.5f;
 bool sprayInhibited = false;
 
+// How far the rover currently sits from the point it is tracking, and the
+// worst it has been on the pass it is driving. Position accuracy and tracking
+// accuracy are different things -- the phone can know exactly where the rover
+// is while the rover still fails to sit on its line -- and this is the number
+// that says which of the two is the problem.
+float offPlanFt = 0.0f;
+float worstOffThisPass = 0.0f;
+
 void bleLog(String msg) {
   if (bleConnected && txCharacteristic != NULL) {
     msg += "\n";
@@ -427,6 +435,8 @@ void planRoute() {
   routeIndex = 0;
   lastRouteIndex = -1;
   sprayInhibited = false;
+  offPlanFt = 0.0f;
+  worstOffThisPass = 0.0f;
   escReverse = false;
   dirChangeAt = millis();
 
@@ -521,6 +531,20 @@ void runFollow() {
   if (reversing != escReverse) {
     escReverse = reversing;
     dirChangeAt = millis();
+  }
+
+  {
+    float ox = route[routeIndex].x - robotX_ft;
+    float oy = route[routeIndex].y - robotY_ft;
+    offPlanFt = sqrtf(ox * ox + oy * oy);
+    // Report the worst of each sprayed pass, then start the next one fresh, so
+    // a bad pass is visible rather than averaged away.
+    if (route[routeIndex].spray) {
+      if (offPlanFt > worstOffThisPass) worstOffThisPass = offPlanFt;
+    } else if (worstOffThisPass > 0.0f) {
+      bleLog("Pass finished, worst " + String(worstOffThisPass, 2) + " ft off line.");
+      worstOffThisPass = 0.0f;
+    }
   }
 
   int la = lookaheadWithinSegment(route, routeCount, routeIndex,
@@ -773,6 +797,7 @@ void loop() {
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " hdg=" + String(robotHeading, 0) +
            " pt=" + String(routeIndex) + "/" + String(routeCount) +
+           " off=" + String(offPlanFt, 2) +
            " ctr=" + String((int)steerCentreUs()) +
            (dryRunMode ? " DRY" : " WET") +
            (sprayActive ? " spray=ON" : " spray=OFF") +
