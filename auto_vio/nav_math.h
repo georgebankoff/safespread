@@ -43,3 +43,20 @@ inline int buildWaypoints(float fieldSideFt, float barWidthFt, float overlapFrac
   }
   return idx;
 }
+
+inline float angleDiffDeg(float target, float current) {
+  float d = target - current;
+  while (d > 180.0f) d -= 360.0f;
+  while (d < -180.0f) d += 360.0f;
+  return d;
+}
+
+inline float bearingToWaypointDeg(float dx, float dy) {
+  float b = atan2f(dx, dy) * (180.0f / (float)M_PI);
+  if (b < 0.0f) b += 360.0f;
+  return b;
+}
+
+inline bool waypointReached(float dx, float dy, float toleranceFt) {
+  return (dx * dx + dy * dy) <= (toleranceFt * toleranceFt);
+}
