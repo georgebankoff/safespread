@@ -98,8 +98,10 @@ void stopDrive() {
   setChannelPulse(STEER_CH, STEER_CENTER_US);
 }
 
+// Log to the app only. Serial is intentionally not used here: in the field
+// there is no laptop attached, and everything below is mirrored in the app's
+// rover panel. See setup() for the one boot-time exception.
 void bleLog(String msg) {
-  Serial.println(msg);
   if (bleConnected && txCharacteristic != NULL) {
     msg += "\n";
     txCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
@@ -314,7 +316,10 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) {
     bleConnected = true;
     bleLog("VIO app connected.");
-    // Re-announce state so a freshly connected app isn't showing stale UI.
+    // Re-announce state so a freshly connected app isn't showing stale UI,
+    // and because these were generated at boot with nobody listening.
+    bleLog("Area " + String(fieldWidthFt, 1) + " x " + String(fieldLengthFt, 1) +
+           " ft -> " + String(waypointCount) + " waypoints.");
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
   }
@@ -360,7 +365,10 @@ void setup() {
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
 
-  Serial.println("VIO Waypoint Navigator ready.");
+  // The only serial output that remains. Everything else goes to the app,
+  // but if the board never reaches this line -- or the app cannot connect --
+  // serial is the sole remaining way to tell a hung board from a BLE problem.
+  Serial.println("VIO Waypoint Navigator ready. Logging to app from here.");
 }
 
 void loop() {
