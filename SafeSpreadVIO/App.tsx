@@ -16,8 +16,8 @@ const ble = new SafeSpreadBLE();
 export default function App() {
   const { pose, trackingState, trackingOk, zero } = useVIOPose();
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
-  const [widthText, setWidthText] = useState('21.9');
-  const [lengthText, setLengthText] = useState('21.9');
+  const [nText, setNText] = useState('21.9');
+  const [mText, setMText] = useState('21.9');
   const [areaNote, setAreaNote] = useState('');
   const [telemetry, setTelemetry] = useState('');
   const [log, setLog] = useState<string[]>([]);
@@ -29,14 +29,14 @@ export default function App() {
 
   const applyArea = () => {
     Keyboard.dismiss();
-    const w = parseFloat(widthText);
-    const l = parseFloat(lengthText);
-    if (!isFinite(w) || !isFinite(l) || w <= 0 || l <= 0) {
+    const n = parseFloat(nText);
+    const m = parseFloat(mText);
+    if (!isFinite(n) || !isFinite(m) || n <= 0 || m <= 0) {
       setAreaNote('Enter positive numbers');
       return;
     }
-    ble.sendArea(w, l);
-    setAreaNote(`Sent ${w} x ${l} ft (${Math.round(w * l)} sqft)`);
+    ble.sendArea(n, m);
+    setAreaNote(`Sent ${n} × ${m} ft (${Math.round(n * m)} sqft)`);
   };
 
   useEffect(() => {
@@ -46,7 +46,10 @@ export default function App() {
       if (line.startsWith('[TLM]')) {
         const body = line.slice(5).trim();
         setTelemetry(body);
-        setRunning(body.startsWith('RUN'));
+        // Turn phases are just as "running" as a pass; only IDLE and DONE
+        // mean Start is safe to press again.
+        const phase = body.split(' ')[0];
+        setRunning(phase !== 'IDLE' && phase !== 'DONE');
       } else if (line === '[SPRAY] ON' || line === '[SPRAY] OFF') {
         setSpraying(line.endsWith('ON'));
       } else if (line === '[MODE] DRY' || line === '[MODE] WET') {
@@ -93,23 +96,25 @@ export default function App() {
       </View>
 
       <View style={styles.areaPanel}>
-        <Text style={styles.label}>Area to cover (ft)</Text>
+        <Text style={styles.label}>
+          Area (ft) — N: straight ahead, M: out to the right
+        </Text>
         <View style={styles.areaRow}>
           <TextInput
             style={styles.input}
-            value={widthText}
-            onChangeText={setWidthText}
+            value={nText}
+            onChangeText={setNText}
             keyboardType="decimal-pad"
-            placeholder="width"
+            placeholder="N"
             placeholderTextColor="#888"
           />
           <Text style={styles.times}>×</Text>
           <TextInput
             style={styles.input}
-            value={lengthText}
-            onChangeText={setLengthText}
+            value={mText}
+            onChangeText={setMText}
             keyboardType="decimal-pad"
-            placeholder="length"
+            placeholder="M"
             placeholderTextColor="#888"
           />
           <Pressable

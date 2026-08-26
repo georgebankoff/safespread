@@ -32,6 +32,7 @@ const int PUMP_PIN  = 6;
 const int NEUTRAL_US       = 1500;
 const int THROTTLE_FWD_US  = 1620;
 const int THROTTLE_TURN_US = 1600;
+const int THROTTLE_REV_US  = 1380;  // reverse leg of the three-point turn
 
 const int STEER_CENTER_US = 1500;
 const int STEER_LEFT_US   = 2390;
@@ -40,18 +41,34 @@ const int STEER_RIGHT_US  = 700;
 const float BAR_WIDTH_FT          = 17.0f / 12.0f;
 const float LANE_OVERLAP_FRACTION = 0.15f;
 
-// Defaults (480 sqft square); overridable at runtime from the app via '!D'.
-float fieldWidthFt  = 21.91f;
-float fieldLengthFt = 21.91f;
-const float WAYPOINT_TOLERANCE_FT = 0.5f;
+// N x M, matching the app's two inputs and set at runtime via '!D'.
+//   N (fieldPassFt)  -- length of the first pass, straight ahead from the
+//                       start corner. Lanes run along this axis (+Y).
+//   M (fieldWidthFt) -- total width covered by stepping lanes to the right (+X).
+float fieldPassFt  = 21.91f;
+float fieldWidthFt = 21.91f;
 const unsigned long VIO_TIMEOUT_MS = 1000;
 
-// Sized with headroom above the ~39 waypoints the current field/bar/overlap
-// constants produce (see buildWaypoints in nav_math.h).
-const int MAX_WAYPOINTS = 48;
-Waypoint waypoints[MAX_WAYPOINTS];
-int waypointCount = 0;
-int currentWaypointIndex = 0;
+int totalLanes  = 0;
+int currentLane = 0;
+
+// Steering polarity. +1 means a pulse BELOW centre steers toward increasing
+// heading (clockwise / to the rover's right), matching STEER_RIGHT_US < centre.
+// If Self Test shows the wheels going opposite to its printed labels, or the
+// rover consistently corrects the wrong way, flip this to -1.
+const int STEER_SIGN = 1;
+
+const float CROSS_TRACK_GAIN = 90.0f;  // us of steering per ft off the lane
+const float HEADING_GAIN     = 14.0f;  // us of steering per degree of error
+const float MAX_STEER_OFFSET = 700.0f;
+
+const float PASS_END_TOL_FT   = 0.4f;
+const float ALIGN_TOL_FT      = 0.25f;
+const float ALIGN_HEADING_TOL = 12.0f;
+const unsigned long TURN_PHASE_TIMEOUT_MS = 6000;
+
+float turnStartHeading = 0.0f;
+unsigned long phaseStart = 0;
 
 float robotX_ft    = 0.0f;
 float robotY_ft    = 0.0f;
@@ -67,8 +84,27 @@ Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
 BLECharacteristic *txCharacteristic = NULL;
 volatile bool bleConnected = false;
 
-enum AutoState { AUTO_IDLE, AUTO_NAVIGATING, AUTO_COMPLETE };
+// A car cannot translate sideways, so shifting one lane (~1.2 ft) between
+// passes needs a three-point turn rather than a waypoint beside the last one.
+enum AutoState {
+  AUTO_IDLE,
+  AUTO_PASS,        // straight run along a lane; the only state that sprays
+  AUTO_TURN_FWD,    // forward, full lock: first ~90 deg of the 180
+  AUTO_TURN_REV,    // reverse, opposite lock: remaining ~90 deg
+  AUTO_TURN_ALIGN,  // creep onto the new lane before spraying again
+  AUTO_COMPLETE
+};
 AutoState state = AUTO_IDLE;
+
+inline bool isNavigating() {
+  return state == AUTO_PASS || state == AUTO_TURN_FWD ||
+         state == AUTO_TURN_REV || state == AUTO_TURN_ALIGN;
+}
+
+// Even lanes run "up" (+Y, heading 0), odd lanes run back "down" (heading 180).
+inline bool laneGoesUp(int lane)     { return (lane % 2) == 0; }
+inline float laneTargetY(int lane)   { return laneGoesUp(lane) ? fieldPassFt : 0.0f; }
+inline float laneDesiredHeading(int lane) { return laneGoesUp(lane) ? 0.0f : 180.0f; }
 
 void setChannelPulse(uint8_t channel, int microseconds) {
   uint16_t ticks = (uint16_t)(((uint32_t)microseconds * 4096UL) / 20000UL);
@@ -109,16 +145,14 @@ void bleLog(String msg) {
   }
 }
 
-void regenerateWaypoints() {
-  waypointCount = buildWaypoints(fieldWidthFt, fieldLengthFt, BAR_WIDTH_FT,
-                                  LANE_OVERLAP_FRACTION, waypoints, MAX_WAYPOINTS);
-  currentWaypointIndex = 0;
-  bleLog("Area " + String(fieldWidthFt, 1) + " x " + String(fieldLengthFt, 1) +
-         " ft (" + String(fieldWidthFt * fieldLengthFt, 0) + " sqft) -> " +
-         String(waypointCount) + " waypoints.");
-  if (waypointCount >= MAX_WAYPOINTS) {
-    bleLog("!! Area too large for waypoint buffer; coverage will be incomplete.");
-  }
+void regenerateLanes() {
+  totalLanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  currentLane = 0;
+  float covered = laneCenterX(totalLanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
+                  BAR_WIDTH_FT * 0.5f;
+  bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
+         " ft -> " + String(totalLanes) + " lanes, covering " +
+         String(covered, 1) + " ft of width.");
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
@@ -171,39 +205,114 @@ void runSelfTest() {
   bleLog("=== SELF TEST COMPLETE ===");
 }
 
-void navigateToWaypoint(const Waypoint &wp) {
-  float dx = wp.x - robotX_ft;
-  float dy = wp.y - robotY_ft;
+// `rightward` > 0 steers toward increasing heading (rover's right).
+void steerRightward(float rightward) {
+  rightward = constrain(rightward, -MAX_STEER_OFFSET, MAX_STEER_OFFSET);
+  int us = STEER_CENTER_US - (int)(STEER_SIGN * rightward);
+  setChannelPulse(STEER_CH, constrain(us, STEER_RIGHT_US, STEER_LEFT_US));
+}
 
-  float targetHeading = bearingToWaypointDeg(dx, dy);
-  float err = angleDiffDeg(targetHeading, robotHeading);
+// Hold the lane line: combine how far off the line we are with how far off
+// the lane heading we are. Cross-track sign flips on return passes because
+// +X lies to the rover's left when it is heading back down the field.
+void holdLane(float laneX, float desiredHeading, bool goingUp) {
+  float crossErr = laneX - robotX_ft;
+  float crossTerm = (goingUp ? 1.0f : -1.0f) * CROSS_TRACK_GAIN * crossErr;
+  float headingTerm = HEADING_GAIN * angleDiffDeg(desiredHeading, robotHeading);
+  steerRightward(crossTerm + headingTerm);
+}
 
-  int steer = STEER_CENTER_US + (int)(err * 25.0f);
-  steer = constrain(steer, STEER_RIGHT_US, STEER_LEFT_US);
-  setChannelPulse(STEER_CH, steer);
+bool insideField() {
+  return robotY_ft >= 0.0f && robotY_ft <= fieldPassFt &&
+         robotX_ft >= -0.5f && robotX_ft <= fieldWidthFt + 0.5f;
+}
 
-  if (fabsf(err) > 45.0f) {
+void beginPass(int lane) {
+  currentLane = lane;
+  phaseStart = millis();
+  state = AUTO_PASS;
+  bleLog(">>> Pass " + String(lane + 1) + "/" + String(totalLanes) + " at x=" +
+         String(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION), 2) + " ft");
+}
+
+void beginTurn() {
+  setSpray(false);
+  turnStartHeading = robotHeading;
+  phaseStart = millis();
+  state = AUTO_TURN_FWD;
+  bleLog(">>> Turning to lane " + String(currentLane + 2) + "/" + String(totalLanes));
+}
+
+void runPass() {
+  float laneX = laneCenterX(currentLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  bool goingUp = laneGoesUp(currentLane);
+  float targetY = laneTargetY(currentLane);
+
+  holdLane(laneX, laneDesiredHeading(currentLane), goingUp);
+  setChannelPulse(ESC_CH, THROTTLE_FWD_US);
+
+  // Spray only on the straight run and only over the rectangle itself, so the
+  // path may overrun the ends but the wetted area stays a clean rectangle.
+  setSpray(insideField());
+
+  bool reached = goingUp ? (robotY_ft >= targetY - PASS_END_TOL_FT)
+                         : (robotY_ft <= targetY + PASS_END_TOL_FT);
+  if (reached) {
+    setSpray(false);
+    if (currentLane + 1 >= totalLanes) {
+      stopDrive();
+      state = AUTO_COMPLETE;
+      bleLog("=== MISSION COMPLETE: " + String(totalLanes) + " lanes ===");
+    } else {
+      beginTurn();
+    }
+  }
+}
+
+// The 180 is split so a car with a turning circle far wider than one lane can
+// still line up on the next lane: swing out forward, then back up around.
+void runTurn() {
+  // Even lanes head up (+Y) with the next lane to the right; odd lanes head
+  // down, putting the next lane to their left.
+  bool turnRight = laneGoesUp(currentLane);
+  float turned = fabsf(angleDiffDeg(robotHeading, turnStartHeading));
+  bool timedOut = (millis() - phaseStart > TURN_PHASE_TIMEOUT_MS);
+
+  if (state == AUTO_TURN_FWD) {
+    steerRightward(turnRight ? MAX_STEER_OFFSET : -MAX_STEER_OFFSET);
     setChannelPulse(ESC_CH, THROTTLE_TURN_US);
-  } else {
-    setChannelPulse(ESC_CH, THROTTLE_FWD_US);
+    if (turned >= 90.0f || timedOut) {
+      stopDrive();
+      phaseStart = millis();
+      state = AUTO_TURN_REV;
+    }
+    return;
   }
 
-  if (waypointReached(dx, dy, WAYPOINT_TOLERANCE_FT)) {
-    currentWaypointIndex++;
-    stopDrive();
-    setSpray(false);
-
-    if (currentWaypointIndex >= waypointCount) {
-      state = AUTO_COMPLETE;
-      bleLog("=== MISSION COMPLETE ===");
-    } else {
-      bleLog(">>> Reached waypoint " + String(currentWaypointIndex) + "/" + String(waypointCount) +
-             ". Next: (" + String(waypoints[currentWaypointIndex].x, 1) + ", " +
-             String(waypoints[currentWaypointIndex].y, 1) + ")");
-      if (currentWaypointIndex % 2 == 0) {
-        setSpray(true);
-      }
+  if (state == AUTO_TURN_REV) {
+    // Reversing with opposite lock keeps rotating the same way round.
+    steerRightward(turnRight ? -MAX_STEER_OFFSET : MAX_STEER_OFFSET);
+    setChannelPulse(ESC_CH, THROTTLE_REV_US);
+    if (turned >= 165.0f || timedOut) {
+      stopDrive();
+      phaseStart = millis();
+      state = AUTO_TURN_ALIGN;
     }
+    return;
+  }
+
+  // AUTO_TURN_ALIGN: creep forward onto the new lane before committing.
+  int nextLane = currentLane + 1;
+  float laneX = laneCenterX(nextLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  float desired = laneDesiredHeading(nextLane);
+  holdLane(laneX, desired, laneGoesUp(nextLane));
+  setChannelPulse(ESC_CH, THROTTLE_TURN_US);
+
+  bool onLine = fabsf(laneX - robotX_ft) < ALIGN_TOL_FT;
+  bool onHeading = fabsf(angleDiffDeg(desired, robotHeading)) < ALIGN_HEADING_TOL;
+  if ((onLine && onHeading) || timedOut) {
+    if (timedOut) bleLog("!! Align timed out; starting pass anyway.");
+    beginPass(nextLane);
   }
 }
 
@@ -231,13 +340,12 @@ void feed(const uint8_t *d, size_t n) {
       // Refused while running: the app re-zeros its VIO origin when Start is
       // pressed, so accepting a restart mid-drive would leave the rover
       // navigating old waypoints in a newly-shifted coordinate frame.
-      if (state == AUTO_NAVIGATING) {
+      if (isNavigating()) {
         bleLog("!! Already running. Press Stop first.");
       } else {
-        state = AUTO_NAVIGATING;
-        currentWaypointIndex = 0;
-        setSpray(true);
-        bleLog(">>> Mission started. " + String(waypointCount) + " waypoints.");
+        bleLog(">>> Mission started: " + String(totalLanes) + " lanes, " +
+               String(fieldPassFt, 1) + " ft per pass.");
+        beginPass(0);
       }
     } else if (d[0] == '2') {
       state = AUTO_IDLE;
@@ -245,14 +353,14 @@ void feed(const uint8_t *d, size_t n) {
       setSpray(false);
       bleLog(">>> Mission stopped.");
     } else if (d[0] == '3') {
-      if (state == AUTO_NAVIGATING) {
+      if (isNavigating()) {
         bleLog("!! Self test refused: stop the mission first.");
       } else {
         runSelfTest();
         stopDrive();
       }
     } else if (d[0] == '4') {
-      if (state == AUTO_NAVIGATING) {
+      if (isNavigating()) {
         bleLog("!! Mode change refused: stop the mission first.");
       } else {
         dryRunMode = !dryRunMode;
@@ -272,16 +380,16 @@ void feed(const uint8_t *d, size_t n) {
   while (accLen - i >= 11) {
     if (acc[i] != '!') { i++; continue; }
 
-    float w, l;
-    if (parseAreaPacket(&acc[i], accLen - i, w, l)) {
-      if (state == AUTO_NAVIGATING) {
+    float n, m;  // N = pass length, M = width, in the app's input order
+    if (parseAreaPacket(&acc[i], accLen - i, n, m)) {
+      if (isNavigating()) {
         bleLog("!! Area change refused while navigating.");
-      } else if (w > 0.5f && l > 0.5f && w < 500.0f && l < 500.0f) {
-        fieldWidthFt = w;
-        fieldLengthFt = l;
-        regenerateWaypoints();
+      } else if (n > 0.5f && m > 0.5f && n < 500.0f && m < 500.0f) {
+        fieldPassFt = n;
+        fieldWidthFt = m;
+        regenerateLanes();
       } else {
-        bleLog("!! Rejected implausible area: " + String(w, 1) + " x " + String(l, 1));
+        bleLog("!! Rejected implausible area: " + String(n, 1) + " x " + String(m, 1));
       }
       i += 11;
       continue;
@@ -318,8 +426,8 @@ class ServerCallbacks : public BLEServerCallbacks {
     bleLog("VIO app connected.");
     // Re-announce state so a freshly connected app isn't showing stale UI,
     // and because these were generated at boot with nobody listening.
-    bleLog("Area " + String(fieldWidthFt, 1) + " x " + String(fieldLengthFt, 1) +
-           " ft -> " + String(waypointCount) + " waypoints.");
+    bleLog("Area " + String(fieldPassFt, 1) + " x " + String(fieldWidthFt, 1) +
+           " ft -> " + String(totalLanes) + " lanes.");
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
   }
@@ -347,7 +455,7 @@ void setup() {
   delay(50);
   stopDrive();
 
-  regenerateWaypoints();
+  regenerateLanes();
 
   BLEDevice::init("SafeSpread");
   BLEServer *server = BLEDevice::createServer();
@@ -381,13 +489,19 @@ void loop() {
   // packets arriving" from "packets fine, navigation misbehaving".
   if (millis() - lastTelemetryTime >= 1000) {
     lastTelemetryTime = millis();
-    bleLog("[TLM] " + String(state == AUTO_NAVIGATING ? "RUN" :
-                             (state == AUTO_COMPLETE ? "DONE" : "IDLE")) +
+    String phase = "IDLE";
+    if (state == AUTO_PASS)            phase = "RUN";
+    else if (state == AUTO_TURN_FWD)   phase = "TURN1";
+    else if (state == AUTO_TURN_REV)   phase = "TURN2";
+    else if (state == AUTO_TURN_ALIGN) phase = "ALIGN";
+    else if (state == AUTO_COMPLETE)   phase = "DONE";
+
+    bleLog("[TLM] " + phase +
            " vio=" + String(vioActive ? "OK" : "NONE") +
            " pkts=" + String(packetCount) +
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " hdg=" + String(robotHeading, 0) +
-           " wp=" + String(currentWaypointIndex) + "/" + String(waypointCount) +
+           " lane=" + String(currentLane + 1) + "/" + String(totalLanes) +
            (dryRunMode ? " DRY" : " WET") +
            (sprayActive ? " spray=ON" : " spray=OFF"));
   }
@@ -395,17 +509,19 @@ void loop() {
   if (vioActive && (millis() - lastVioTime > VIO_TIMEOUT_MS)) {
     vioActive = false;
     stopDrive();
-    if (state == AUTO_NAVIGATING) {
+    if (isNavigating()) {
       bleLog("!!! VIO signal lost. Stopping. !!!");
       state = AUTO_IDLE;
     }
   }
 
-  if (state == AUTO_NAVIGATING) {
-    if (vioActive) {
-      navigateToWaypoint(waypoints[currentWaypointIndex]);
-    } else {
+  if (isNavigating()) {
+    if (!vioActive) {
       stopDrive();
+    } else if (state == AUTO_PASS) {
+      runPass();
+    } else {
+      runTurn();
     }
   }
 }

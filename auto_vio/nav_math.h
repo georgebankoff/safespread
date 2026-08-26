@@ -31,6 +31,28 @@ inline bool parseAreaPacket(const uint8_t* d, size_t n, float& widthFt, float& l
   return true;
 }
 
+// --- Lane geometry -------------------------------------------------------
+// Lanes are spaced so the spray bar tiles the width with a little overlap.
+// The first lane is half a bar-width in from the edge, so the sprayed band
+// starts exactly at x=0 and never spills past the far edge: an area not
+// divisible by the bar width is under-covered at the far side, never over.
+
+inline float laneSpacing(float barWidthFt, float overlapFraction) {
+  float s = barWidthFt * (1.0f - overlapFraction);
+  return (s > 0.01f) ? s : 0.01f;
+}
+
+inline float laneCenterX(int lane, float barWidthFt, float overlapFraction) {
+  return barWidthFt * 0.5f + lane * laneSpacing(barWidthFt, overlapFraction);
+}
+
+inline int laneCount(float widthFt, float barWidthFt, float overlapFraction) {
+  if (widthFt <= barWidthFt) return 1;
+  float usable = widthFt - barWidthFt;
+  int n = (int)floorf(usable / laneSpacing(barWidthFt, overlapFraction)) + 1;
+  return (n < 1) ? 1 : n;
+}
+
 struct Waypoint {
   float x;
   float y;
