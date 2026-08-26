@@ -183,6 +183,7 @@ const float HEADLAND_MARGIN_FT  = 5.0f;
 const int   MAX_SHUFFLE_LEGS    = 16;
 const int   MAX_ALIGN_RETRIES   = 2;
 int alignRetries = 0;
+int targetLane = 0;
 
 bool turnRightward = true;
 int  shuffleLegs = 0;
@@ -420,6 +421,29 @@ int nearestUncoveredLane() {
   return best;
 }
 
+// How many lanes a 180 naturally carries the rover across. A turning circle of
+// ~8ft against ~1.2ft lanes lands it nearly seven lanes over, so asking for the
+// adjacent lane means crabbing back against the geometry -- a parking maneuver
+// a car does badly. Skipping instead lets each turn land where it wants to.
+int laneSkip() {
+  if (!radiusKnown) return 1;
+  float s = laneSpacing(BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  int k = (int)lroundf((2.0f * turnRadiusFt) / s);
+  if (k < 1) k = 1;
+  if (k > totalLanes - 1 && totalLanes > 1) k = totalLanes - 1;
+  return k;
+}
+
+// Prefer the lane the turn will land on anyway; fall back to whatever is left.
+int nextLaneToDrive() {
+  int k = laneSkip();
+  int ahead = currentLane + k;
+  if (ahead < totalLanes && !laneCovered[ahead]) return ahead;
+  int behind = currentLane - k;
+  if (behind >= 0 && !laneCovered[behind]) return behind;
+  return nearestUncoveredLane();
+}
+
 int lanesRemaining() {
   int n = 0;
   for (int i = 0; i < totalLanes; i++) if (!laneCovered[i]) n++;
@@ -444,25 +468,25 @@ void beginTurn() {
   turnStartHeading = robotHeading;
   phaseStart = millis();
   shuffleLegs = 0;
+  alignRetries = 0;
   legStartX = robotX_ft;
   legStartY = robotY_ft;
 
-  // Rotate toward whichever side still has uncovered lanes. Heading up, +X is
-  // to the rover's right; heading down it is to its left.
-  bool workToPositiveX = false;
-  for (int i = 0; i < totalLanes; i++) {
-    if (!laneCovered[i] &&
-        laneCenterX(i, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) > robotX_ft) {
-      workToPositiveX = true;
-      break;
-    }
-  }
-  turnRightward = passGoesUp ? workToPositiveX : !workToPositiveX;
+  // Decide the destination first so the turn can be aimed at it, rather than
+  // sweeping blindly and then trying to crab onto whatever it passed.
+  targetLane = nextLaneToDrive();
+  if (targetLane < 0) targetLane = currentLane;
+
+  float targetX = laneCenterX(targetLane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
+  bool toPositiveX = targetX > robotX_ft;
+  // Heading up, +X is to the rover's right; heading down it is to its left.
+  turnRightward = passGoesUp ? toPositiveX : !toPositiveX;
 
   legStartHeading = robotHeading;
   state = (radiusKnown && useWideTurn) ? AUTO_ARC : AUTO_SHUFFLE_FWD;
-  bleLog(">>> Turning " + String(turnRightward ? "right" : "left") + " (" +
-         String(state == AUTO_ARC ? "sweep" : "3-point") + ")");
+  bleLog(">>> Turn " + String(turnRightward ? "right" : "left") + " (" +
+         String(state == AUTO_ARC ? "sweep" : "3-point") + ") to lane " +
+         String(targetLane + 1) + ", " + String(targetX - robotX_ft, 1) + " ft over");
 }
 
 void runPass() {
@@ -510,7 +534,21 @@ void runPass() {
 
 // Once rotated, choose the lane and the end of the field to work from.
 void finishRotation() {
-  int lane = nearestUncoveredLane();
+  // Stick with the lane the turn was aimed at, unless it got taken or the
+  // sweep landed nearer a different one that still needs doing.
+  int lane = targetLane;
+  if (lane < 0 || lane >= totalLanes || laneCovered[lane]) {
+    lane = nearestUncoveredLane();
+  } else {
+    int near = nearestUncoveredLane();
+    if (near >= 0) {
+      float dTarget = fabsf(laneCenterX(lane, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft);
+      float dNear = fabsf(laneCenterX(near, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) - robotX_ft);
+      // Only switch if the landing is clearly closer to something else.
+      if (dNear + laneSpacing(BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) < dTarget) lane = near;
+    }
+  }
+
   if (lane < 0) {
     stopDrive();
     state = AUTO_COMPLETE;
