@@ -1,13 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Keyboard, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useVIOPose } from './src/useVIOPose';
 import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
 
 const ble = new SafeSpreadBLE();
 
 export default function App() {
-  const { pose, trackingOk, zero } = useVIOPose();
+  const { pose, trackingState, trackingOk, zero } = useVIOPose();
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
+  const [widthText, setWidthText] = useState('21.9');
+  const [lengthText, setLengthText] = useState('21.9');
+  const [areaNote, setAreaNote] = useState('');
+
+  const applyArea = () => {
+    Keyboard.dismiss();
+    const w = parseFloat(widthText);
+    const l = parseFloat(lengthText);
+    if (!isFinite(w) || !isFinite(l) || w <= 0 || l <= 0) {
+      setAreaNote('Enter positive numbers');
+      return;
+    }
+    ble.sendArea(w, l);
+    setAreaNote(`Sent ${w} x ${l} ft (${Math.round(w * l)} sqft)`);
+  };
 
   useEffect(() => {
     ble.connect(setStatus).catch(() => {});
@@ -33,7 +48,37 @@ export default function App() {
         <Text style={styles.text}>Y: {pose.y.toFixed(1)} ft</Text>
         <Text style={styles.text}>Hdg: {pose.heading.toFixed(0)}°</Text>
         <Text style={styles.text}>BLE: {status}</Text>
-        <Text style={styles.text}>Tracking: {trackingOk ? 'OK' : 'DEGRADED'}</Text>
+        <Text style={styles.text}>
+          Tracking: {trackingState}
+          {trackingOk ? '' : ' (not sending)'}
+        </Text>
+      </View>
+
+      <View style={styles.areaPanel}>
+        <Text style={styles.label}>Area to cover (ft)</Text>
+        <View style={styles.areaRow}>
+          <TextInput
+            style={styles.input}
+            value={widthText}
+            onChangeText={setWidthText}
+            keyboardType="decimal-pad"
+            placeholder="width"
+            placeholderTextColor="#888"
+          />
+          <Text style={styles.times}>×</Text>
+          <TextInput
+            style={styles.input}
+            value={lengthText}
+            onChangeText={setLengthText}
+            keyboardType="decimal-pad"
+            placeholder="length"
+            placeholderTextColor="#888"
+          />
+          <Pressable style={styles.areaButton} onPress={applyArea}>
+            <Text style={styles.buttonText}>Set</Text>
+          </Pressable>
+        </View>
+        {areaNote ? <Text style={styles.note}>{areaNote}</Text> : null}
       </View>
       <View style={styles.buttons}>
         <Pressable
@@ -71,6 +116,35 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
   hud: { position: 'absolute', top: 60, left: 20 },
+  areaPanel: {
+    position: 'absolute',
+    top: 200,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    padding: 12,
+    borderRadius: 8,
+  },
+  label: { color: 'white', fontSize: 14, fontWeight: '600', marginBottom: 8 },
+  areaRow: { flexDirection: 'row', alignItems: 'center' },
+  input: {
+    flex: 1,
+    backgroundColor: '#222',
+    color: 'white',
+    fontSize: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+  },
+  times: { color: 'white', fontSize: 18, marginHorizontal: 8 },
+  areaButton: {
+    backgroundColor: '#1565c0',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    marginLeft: 10,
+  },
+  note: { color: '#9ecbff', fontSize: 13, marginTop: 8 },
   text: { color: 'white', fontSize: 18, fontWeight: '600' },
   buttons: {
     position: 'absolute',
