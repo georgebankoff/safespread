@@ -7,7 +7,12 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.safespread.vio",
+      "infoPlist": {
+        "NSCameraUsageDescription": "SafeSpreadVIO uses the camera for visual-inertial position tracking.",
+        "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -20,6 +25,7 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": ["expo-camera", "expo-dev-client"]
   }
 }
