@@ -32,6 +32,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
   private ackListeners = new Set<(packet: Uint8Array) => void>();
   private telemetryListeners = new Set<(telemetry: TelemetryV2) => void>();
   private faultSampleListeners = new Set<(sample: FaultSampleV2) => void>();
+  private faultPacketListeners = new Set<(packet: Uint8Array) => void>();
   private disconnectListeners = new Set<() => void>();
 
   connect(
@@ -142,6 +143,11 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     return () => this.faultSampleListeners.delete(listener);
   }
 
+  subscribeFaultPackets(listener: (packet: Uint8Array) => void): Remove {
+    this.faultPacketListeners.add(listener);
+    return () => this.faultPacketListeners.delete(listener);
+  }
+
   subscribeDisconnect(listener: () => void): Remove {
     this.disconnectListeners.add(listener);
     return () => this.disconnectListeners.delete(listener);
@@ -170,6 +176,15 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     } finally {
       if (timer) clearTimeout(timer);
       unsubscribe();
+    }
+  }
+
+  async emergencyStop(): Promise<void> {
+    const commandId = (Date.now() >>> 0) || 1;
+    try {
+      await this.writeWithResponse(buildCommandV2({ opcode: 3, epoch: 0, commandId }));
+    } finally {
+      await this.writeCompatibilityStop();
     }
   }
 
@@ -216,6 +231,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
       const sample = parseFaultSampleV2(bytes);
       if (sample) {
         for (const listener of this.faultSampleListeners) listener(sample);
+        for (const listener of this.faultPacketListeners) listener(bytes.slice());
         return;
       }
       this.logListener?.(`[PROTO] rejected binary notification (${bytes.length} bytes)`);

@@ -534,7 +534,16 @@ void enterFault(FaultCode fault) {
   summary.droppedPackets = saturatedPacketDrops();
   summary.invalidPackets = saturatedCounter(invalidPacketCount);
   summary.controlSequence = lastControlSequence;
-  faultSummary.persistOnce(summary);
+  if (faultSummary.persistOnce(summary)) {
+    bootFaultSummary = summary;
+    hasBootFaultSummary = true;
+    bleLog("[FAULT SUMMARY] epoch=" + String(summary.epoch) +
+           " fault=" + String(static_cast<int>(summary.fault)) +
+           " pt=" + String(summary.routeIndex) +
+           " drops=" + String(summary.droppedPackets) +
+           " invalid=" + String(summary.invalidPackets) +
+           " seq=" + String(summary.controlSequence));
+  }
   bleLog("!!! FAULT " + String(static_cast<int>(fault)) +
          " -- drive neutral, steering centred, spray off. !!!");
 }

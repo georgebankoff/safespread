@@ -1,370 +1,726 @@
-import React, { useEffect, useRef, useState } from 'react';
-import {
-  Keyboard,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import React, { useEffect, useReducer, useRef, useState } from 'react';
+import { File, Paths } from 'expo-file-system';
 import { useKeepAwake } from 'expo-keep-awake';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
-import { useVIOPose } from './src/useVIOPose';
-import { ConnectionStatus, SafeSpreadBLE } from './src/ble';
-import PathMap from './src/PathMap';
-import { PathPoint, MAX_PATH_POINTS, shouldRecord } from './src/pathMath';
-import { defineEnteredRectangle, RectangleDefinition, worldToRectangle } from './src/rectangle';
+import { SafeSpreadBLE } from './src/ble';
+import { CalibrationRecord, createCalibration } from './src/calibration';
+import { loadCalibration, saveCalibration } from './src/calibrationStore';
+import { LatestPoseSender } from './src/latestPoseSender';
+import { MissionControl } from './src/missionControl';
+import { missionJsonlToCsv } from './src/missionCsv';
+import {
+  createFileLogSink,
+  exportMissionLog,
+  listMissionLogs,
+  MissionLogFile,
+  MissionLogger,
+  MissionRecord,
+} from './src/missionLog';
+import { MAX_PATH_POINTS, PathPoint, shouldRecord } from './src/pathMath';
+import { wrappedHeadingDelta } from './src/poseMath';
+import { buildPoseV2, FaultSampleV2, TelemetryV2 } from './src/protocolV2';
+import { worldToRectangle } from './src/rectangle';
+import RunningMission from './src/RunningMission';
+import SetupWizard, { CalibrationFormValue } from './src/SetupWizard';
+import { assembleFaultPackets, initialSetupState, setupReducer } from './src/setupMachine';
+import { DEFAULT_MOUNT_CALIBRATION, useVIOPose } from './src/useVIOPose';
 
+const HARDWARE_TAG = 'safespread-rover-a';
+const APP_VERSION = '1.0.0';
+const FIRMWARE_VERSION = 'protocol-v2-acknowledged';
+const START_POSITION_TOLERANCE_FT = 0.75;
+const START_HEADING_TOLERANCE_DEG = 5;
 const ble = new SafeSpreadBLE();
 
+function faultName(code: number): string {
+  const names = [
+    'none', 'BLE disconnected', 'pose timeout', 'invalid pose', 'pose jump',
+    'PWM controller', 'I2C controller', 'no-motion stall', 'wrong direction',
+    'tracking degraded', 'route invalid', 'calibration mismatch', 'headland insufficient',
+  ];
+  return names[code] ?? `firmware fault ${code}`;
+}
+
+async function nextMissionEpoch(): Promise<number> {
+  const file = new File(Paths.document, 'SafeSpread', 'mission-epoch.txt');
+  let previous = Math.floor(Date.now() / 1000) & 0xffff;
+  if (file.exists) {
+    const decoded = Number.parseInt(await file.text(), 10);
+    if (Number.isInteger(decoded) && decoded >= 0 && decoded <= 0xffff) previous = decoded;
+  }
+  const next = (previous + 1) & 0xffff;
+  file.create({ intermediates: true, overwrite: true });
+  file.write(String(next));
+  return next;
+}
+
 export default function App() {
-  // The screen locking would suspend ARKit and the BLE writes with it,
-  // stranding the rover mid-pass until its VIO timeout stops it.
   useKeepAwake();
-
-  const { pose, trackingState, trackingOk } = useVIOPose();
-
-  // In dry mode nothing is dispensed, so the beep is the only audible cue that
-  // the rover thinks it is spraying -- useful when it is across the yard.
   const beep = useAudioPlayer(require('./assets/spray-beep.wav'));
-  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
-  const [nText, setNText] = useState('21.9');
-  const [mText, setMText] = useState('21.9');
-  const [areaNote, setAreaNote] = useState('');
-  const [telemetry, setTelemetry] = useState('');
-  const [log, setLog] = useState<string[]>([]);
-  const [dryRun, setDryRun] = useState(false);
-  const [spraying, setSpraying] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [sentCount, setSentCount] = useState(0);
+  const [setup, dispatch] = useReducer(setupReducer, undefined, initialSetupState);
+  const setupRef = useRef(setup);
+  setupRef.current = setup;
+  const [calibration, setCalibration] = useState<CalibrationRecord | null>(null);
+  const mountCalibration = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+  const vio = useVIOPose(mountCalibration);
+  const trackingOkRef = useRef(vio.trackingOk);
+  trackingOkRef.current = vio.trackingOk;
+  const [busy, setBusy] = useState(false);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  const [calibrationProgress, setCalibrationProgress] = useState('');
+  const [recentLogs, setRecentLogs] = useState<MissionLogFile[]>([]);
+  const [telemetry, setTelemetry] = useState<TelemetryV2 | null>(null);
+  const telemetryRef = useRef<TelemetryV2 | null>(null);
   const [path, setPath] = useState<PathPoint[]>([]);
-  const [mapOpen, setMapOpen] = useState(false);
-  const [activeRectangle, setActiveRectangle] = useState<RectangleDefinition | null>(null);
-  const logRef = useRef<ScrollView>(null);
+  const [logName, setLogName] = useState<string | null>(null);
+  const [faultDumpUri, setFaultDumpUri] = useState<string | null>(null);
 
-  const applyArea = () => {
-    Keyboard.dismiss();
-    const n = parseFloat(nText);
-    const m = parseFloat(mText);
-    if (!isFinite(n) || !isFinite(m) || n <= 0 || m <= 0) {
-      setAreaNote('Enter positive numbers');
-      return;
+  const controlRef = useRef<MissionControl | null>(null);
+  const senderRef = useRef<LatestPoseSender | null>(null);
+  const loggerRef = useRef<MissionLogger | null>(null);
+  const epochRef = useRef<number | null>(null);
+  const calibrationWireRef = useRef<CalibrationRecord | typeof DEFAULT_MOUNT_CALIBRATION | null>(null);
+  const poseStreamingRef = useRef(false);
+  const rectangleConfiguredRef = useRef(false);
+  const calibrationPreparedRef = useRef(false);
+  const resourceWetRef = useRef<boolean | null>(null);
+  const lastPoseOfferedSequenceRef = useRef(0);
+  const poseBySequenceRef = useRef(new Map<number, MissionRecord>());
+  const faultPacketsRef = useRef<Uint8Array[]>([]);
+  const faultHandledRef = useRef(false);
+  const bootFaultSummaryRef = useRef<string | null>(null);
+  const calibrationWaiterRef = useRef<{
+    resolve(message: string): void;
+    reject(error: Error): void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  const selfTestWaiterRef = useRef<{
+    resolve(message: string): void;
+    reject(error: Error): void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+
+  function refreshLogs() {
+    try {
+      setRecentLogs(listMissionLogs());
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
     }
-    ble.sendArea(n, m);
-    setAreaNote(`Sent M ${m} × N ${n} ft (${Math.round(n * m)} sqft)`);
-  };
+  }
 
-  // Keep beeping even with the ringer switch flipped to silent, which is where
-  // a phone strapped to a rover usually lives.
+  function recordLog(record: MissionRecord) {
+    const logger = loggerRef.current;
+    if (!logger) return;
+    void logger.record(record).catch((error) => {
+      dispatch({ type: 'SET_LOGGING_READY', ready: false });
+      const current = setupRef.current;
+      if (current.wet && ['arming', 'armed', 'starting', 'running'].includes(current.phase)) {
+        void handleMissionFault(`authoritative mission log failed: ${error.message}`);
+      } else {
+        setOperationError(`Mission log failed: ${error.message}`);
+      }
+    });
+  }
+
+  async function closeLogger() {
+    const logger = loggerRef.current;
+    loggerRef.current = null;
+    if (logger) await logger.close();
+    refreshLogs();
+  }
+
+  async function releaseMissionResources(closeLog = true) {
+    poseStreamingRef.current = false;
+    const sender = senderRef.current;
+    senderRef.current = null;
+    if (sender) await sender.stop().catch(() => {});
+    controlRef.current?.dispose();
+    controlRef.current = null;
+    epochRef.current = null;
+    calibrationWireRef.current = null;
+    rectangleConfiguredRef.current = false;
+    calibrationPreparedRef.current = false;
+    resourceWetRef.current = null;
+    poseBySequenceRef.current.clear();
+    if (closeLog) await closeLogger().catch((error) => {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    });
+  }
+
+  async function ensureMissionResources() {
+    if (!setup.rectangle) throw new Error('Define the rectangle before starting a mission.');
+    if (controlRef.current && senderRef.current && epochRef.current !== null &&
+        resourceWetRef.current === setup.wet) {
+      return { control: controlRef.current, epoch: epochRef.current };
+    }
+    if (controlRef.current || senderRef.current || loggerRef.current) {
+      await controlRef.current?.stop().catch(() => {});
+      await releaseMissionResources(true);
+      dispatch({ type: 'SET_LOGGING_READY', ready: false });
+    }
+    const epoch = await nextMissionEpoch();
+    const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+    const missionId = `${new Date().toISOString().replace(/[:.]/g, '-')}-e${epoch}`;
+    try {
+      const fileLog = await createFileLogSink(missionId);
+      const logger = await MissionLogger.create({
+        missionId,
+        createdAtIso: new Date().toISOString(),
+        appVersion: APP_VERSION,
+        firmwareVersion: FIRMWARE_VERSION,
+        protocolVersion: 2,
+        epoch,
+        calibrationId: wire.id,
+        calibrationSchemaVersion: wire.schemaVersion,
+        pavement: {
+          surface: calibration?.surface ?? 'other',
+          condition: setup.wet ? 'wet' : 'dry',
+        },
+        rectangle: {
+          source: setup.rectangle.source,
+          mFt: setup.rectangle.mFt,
+          nFt: setup.rectangle.nFt,
+          side: setup.rectangle.side,
+        },
+      }, fileLog.sink);
+      loggerRef.current = logger;
+      setLogName(fileLog.uri.split('/').pop() ?? missionId);
+      dispatch({ type: 'SET_LOGGING_READY', ready: true });
+    } catch (error) {
+      dispatch({ type: 'SET_LOGGING_READY', ready: false });
+      if (setup.wet) throw new Error(`Wet operation requires a mission log: ${error instanceof Error ? error.message : String(error)}`);
+      setOperationError(`Dry diagnostic log unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const control = new MissionControl(ble, epoch, () => trackingOkRef.current, {
+      dryMode: !setup.wet,
+      preferForwardOnly: true,
+    });
+    const sender = new LatestPoseSender(ble, (error) => {
+      void handleMissionFault(`pose transport failed: ${error.message}`);
+    });
+    controlRef.current = control;
+    senderRef.current = sender;
+    epochRef.current = epoch;
+    calibrationWireRef.current = wire;
+    poseStreamingRef.current = true;
+    rectangleConfiguredRef.current = false;
+    calibrationPreparedRef.current = false;
+    resourceWetRef.current = setup.wet;
+    faultHandledRef.current = false;
+    faultPacketsRef.current = [];
+    setFaultDumpUri(null);
+    setPath([]);
+    return { control, epoch };
+  }
+
+  async function persistFaultDump(samples: FaultSampleV2[], epoch: number): Promise<string> {
+    const file = new File(Paths.document, 'SafeSpread', 'faults', `fault-e${epoch}-${Date.now()}.json`);
+    file.create({ intermediates: true, overwrite: true });
+    file.write(JSON.stringify({
+      schemaVersion: 1,
+      epoch,
+      persistedSummary: bootFaultSummaryRef.current,
+      samples,
+    }, null, 2));
+    return file.uri;
+  }
+
+  async function handleMissionFault(cause: string) {
+    if (faultHandledRef.current) return;
+    faultHandledRef.current = true;
+    dispatch({ type: 'MISSION_FAULT', cause });
+    setBusy(true);
+    recordLog({ type: 'fault', phoneMs: Date.now(), fault: cause, state: 'FAULT' });
+    const control = controlRef.current;
+    const epoch = epochRef.current;
+    try {
+      if (control) await control.stop();
+      else await ble.emergencyStop();
+    } catch (error) {
+      setOperationError(`Stop acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (control && epoch !== null) {
+      faultPacketsRef.current = [];
+      try {
+        await control.dumpFault();
+        const samples = assembleFaultPackets(faultPacketsRef.current, epoch);
+        for (const sample of samples) {
+          const { state: firmwareState, ...fields } = sample;
+          recordLog({
+            type: 'fault_buffer',
+            phoneMs: Date.now(),
+            ...fields,
+            firmwareState,
+          });
+        }
+        if (bootFaultSummaryRef.current) {
+          recordLog({ type: 'persisted_fault_summary', phoneMs: Date.now(), summary: bootFaultSummaryRef.current });
+        }
+        setFaultDumpUri(await persistFaultDump(samples, epoch));
+      } catch (error) {
+        recordLog({
+          type: 'fault_buffer_error',
+          phoneMs: Date.now(),
+          fault: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    poseStreamingRef.current = false;
+    await senderRef.current?.stop().catch(() => {});
+    await closeLogger().catch((error) => {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    });
+    setBusy(false);
+  }
+
   useEffect(() => {
     setAudioModeAsync({ playsInSilentMode: true }).catch(() => {});
     beep.loop = true;
   }, []);
 
   useEffect(() => {
-    if (dryRun && spraying) {
+    const spraying = Boolean(telemetry && (telemetry.flags & 1));
+    if (!setup.wet && spraying) {
       beep.seekTo(0);
       beep.play();
     } else {
       beep.pause();
     }
-  }, [dryRun, spraying]);
+  }, [setup.wet, telemetry?.flags]);
 
   useEffect(() => {
-    const handleLog = (line: string) => {
-      // Telemetry is a once-per-second heartbeat; pin it rather than letting
-      // it scroll the interesting mission messages away.
-      if (line.startsWith('[TLM]')) {
-        const body = line.slice(5).trim();
-        setTelemetry(body);
-        // Turn phases are just as "running" as a pass; only IDLE and DONE
-        // mean Start is safe to press again.
-        const phase = body.split(' ')[0];
-        setRunning(phase !== 'IDLE' && phase !== 'DONE');
-      } else if (line === '[SPRAY] ON' || line === '[SPRAY] OFF') {
-        setSpraying(line.endsWith('ON'));
-      } else if (line === '[MODE] DRY' || line === '[MODE] WET') {
-        setDryRun(line.endsWith('DRY'));
-      } else {
-        setLog((prev) => [...prev.slice(-40), line]);
+    void loadCalibration(HARDWARE_TAG).then((result) => {
+      setCalibration(result.calibration);
+      dispatch({
+        type: 'SET_CALIBRATION_STATUS',
+        status: result.reason === 'ready' ? 'ready' : result.reason === 'missing' ? 'missing' : 'stale',
+      });
+    }).catch((error) => {
+      setOperationError(`Calibration load failed: ${error instanceof Error ? error.message : String(error)}`);
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
+    });
+    refreshLogs();
+  }, []);
+
+  useEffect(() => {
+    const removeTelemetry = ble.subscribeTelemetry((next) => {
+      telemetryRef.current = next;
+      setTelemetry(next);
+      const poseRecord = poseBySequenceRef.current.get(next.consumedPoseSequence) ?? {};
+      recordLog({
+        ...poseRecord,
+        type: 'control',
+        phoneMs: Date.now(),
+        sequence: next.consumedPoseSequence,
+        epoch: next.epoch,
+        routeIndex: next.routeIndex,
+        crossTrackFt: next.crossTrackFt,
+        headingErrorDeg: next.headingErrorDeg,
+        speedFps: next.speedFps,
+        steeringUs: next.steeringUs,
+        throttleUs: next.throttleUs,
+        fault: next.faultCode,
+        spray: Boolean(next.flags & 1),
+        reverse: Boolean(next.flags & 2),
+        pwmReady: Boolean(next.flags & 4),
+        poseAgeMs: next.poseAgeMs,
+        droppedPackets: next.droppedPackets,
+      });
+      if (next.state === 4 && setupRef.current.phase === 'running') {
+        dispatch({ type: 'MISSION_COMPLETE' });
+        recordLog({ type: 'state', phoneMs: Date.now(), state: 'COMPLETE' });
+        poseStreamingRef.current = false;
+        void senderRef.current?.stop().catch(() => {});
+        void closeLogger().catch((error) => setOperationError(error.message));
+      } else if (next.state === 5) {
+        void handleMissionFault(faultName(next.faultCode));
       }
-    };
-    ble.connect(setStatus, handleLog).catch(() => {});
+    });
+    const removeFaultPackets = ble.subscribeFaultPackets((packet) => {
+      faultPacketsRef.current.push(packet);
+    });
+    const removeDisconnect = ble.subscribeDisconnect(() => {
+      controlRef.current?.notifyDisconnect();
+      const phase = setupRef.current.phase;
+      if (['arming', 'armed', 'starting', 'running'].includes(phase)) {
+        void handleMissionFault('BLE disconnected');
+      }
+    });
+    void ble.connect(
+      (status) => dispatch({
+        type: 'CONNECTION_CHANGED',
+        status,
+        compatible: status === 'connected',
+      }),
+      (line) => {
+        if (line.startsWith('[BOOT FAULT]') || line.startsWith('[FAULT SUMMARY]')) {
+          bootFaultSummaryRef.current = line;
+        }
+        if (line.startsWith('[CAL')) {
+          setCalibrationProgress(line);
+          const waiter = calibrationWaiterRef.current;
+          if (waiter && (line.startsWith('[CAL PASS]') || line.startsWith('[CAL SAMPLE]') || line.startsWith('[CAL FAIL]'))) {
+            clearTimeout(waiter.timer);
+            calibrationWaiterRef.current = null;
+            if (line.startsWith('[CAL FAIL]')) waiter.reject(new Error(line));
+            else waiter.resolve(line);
+          }
+        }
+        if (line.startsWith('=== SELF TEST')) {
+          setCalibrationProgress(line);
+          const waiter = selfTestWaiterRef.current;
+          if (waiter && (line.includes('COMPLETE') || line.includes('FAILED') ||
+              line.includes('ABORTED') || line.includes('STOPPED'))) {
+            clearTimeout(waiter.timer);
+            selfTestWaiterRef.current = null;
+            if (line.includes('COMPLETE')) waiter.resolve(line);
+            else waiter.reject(new Error(line));
+          }
+        }
+        recordLog({ type: 'firmware_log', phoneMs: Date.now(), message: line });
+      },
+    ).catch((error) => setOperationError(error instanceof Error ? error.message : String(error)));
     return () => {
-      ble.disconnect();
+      removeTelemetry();
+      removeFaultPackets();
+      removeDisconnect();
+      controlRef.current?.dispose();
+      void ble.disconnect();
     };
   }, []);
 
-  // Read through refs, and depend on nothing: `pose` is a fresh object every
-  // ARKit frame (~60Hz), so listing it here would clear and recreate the
-  // interval every ~16ms and the 100ms tick would never once fire.
-  const sendStateRef = useRef({ pose, status, trackingOk, spraying, running, activeRectangle });
-  sendStateRef.current = { pose, status, trackingOk, spraying, running, activeRectangle };
+  const rectanglePose = vio.validatedPose && setup.rectangle
+    ? worldToRectangle(vio.validatedPose.rover, setup.rectangle)
+    : null;
+  const atStart = Boolean(rectanglePose &&
+    Math.hypot(rectanglePose.x, rectanglePose.y) <= START_POSITION_TOLERANCE_FT &&
+    Math.abs(wrappedHeadingDelta(rectanglePose.heading, 0)) <= START_HEADING_TOLERANCE_DEG);
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      const current = sendStateRef.current;
-      const rectanglePose = current.pose && current.activeRectangle
-        ? worldToRectangle(current.pose, current.activeRectangle)
-        : null;
-      if (rectanglePose && current.status === 'connected' && current.trackingOk) {
-        ble.sendPose(rectanglePose.x, rectanglePose.y, rectanglePose.heading);
-        setSentCount((n) => n + 1);
-      }
+    dispatch({
+      type: 'SET_READINESS',
+      trackingNormal: vio.trackingOk,
+      poseStable: vio.readiness.ready,
+      atStart,
+    });
+  }, [vio.trackingOk, vio.readiness.ready, atStart]);
 
-      // Trace the mission, including the headland turns, so the map shows the
-      // real path and not just the sprayed parts.
-      if (rectanglePose && current.running) {
-        const next: PathPoint = {
-          x: rectanglePose.x,
-          y: rectanglePose.y,
-          spraying: current.spraying,
-        };
-        setPath((prev) =>
-          shouldRecord(prev[prev.length - 1], next)
-            ? [...prev.slice(-(MAX_PATH_POINTS - 1)), next]
-            : prev
-        );
+  useEffect(() => {
+    const validated = vio.validatedPose;
+    const sender = senderRef.current;
+    const epoch = epochRef.current;
+    const wire = calibrationWireRef.current;
+    const rectangle = setupRef.current.rectangle;
+    if (!validated || !sender || epoch === null || !wire || !rectangle ||
+        !poseStreamingRef.current || !vio.trackingOk) return;
+    const roverPose = rectangleConfiguredRef.current
+      ? worldToRectangle(validated.rover, rectangle)
+      : validated.rover;
+    const ageMs = Math.max(0, validated.captureAgeMs +
+      (globalThis.performance?.now() ?? Date.now()) - validated.receivedAtMs);
+    const yawRate = rectangleConfiguredRef.current && rectangle.side === 'left'
+      ? -validated.yawRateDps
+      : validated.yawRateDps;
+    try {
+      sender.offer(buildPoseV2({
+        flags: 1 | (validated.courseDeg === null ? 0 : 2) | 4,
+        epoch,
+        sequence: validated.sequence,
+        ageMs,
+        x: roverPose.x,
+        y: roverPose.y,
+        heading: roverPose.heading,
+        speedFps: validated.speedFps,
+        yawRateDps: yawRate,
+        calibrationId: wire.id,
+      }));
+      lastPoseOfferedSequenceRef.current = validated.sequence;
+      const poseRecord: MissionRecord = {
+        type: 'pose',
+        phoneMs: Date.now(),
+        sequence: validated.sequence,
+        epoch,
+        xFt: roverPose.x,
+        yFt: roverPose.y,
+        headingDeg: roverPose.heading,
+        speedFps: validated.speedFps,
+        yawRateDps: yawRate,
+        trackingValid: true,
+        captureAgeMs: ageMs,
+        cameraXFt: validated.camera.x,
+        cameraYFt: validated.camera.y,
+        cameraHeadingDeg: validated.camera.heading,
+        roverWorldXFt: validated.rover.x,
+        roverWorldYFt: validated.rover.y,
+        sprayWorldXFt: validated.sprayBar.x,
+        sprayWorldYFt: validated.sprayBar.y,
+        trackingState: vio.trackingState,
+        trackingReason: vio.trackingReason,
+        mappingStatus: vio.mappingStatus,
+        senderDropped: sender.dropped,
+      };
+      poseBySequenceRef.current.set(validated.sequence, poseRecord);
+      while (poseBySequenceRef.current.size > 256) {
+        const oldest = poseBySequenceRef.current.keys().next().value as number | undefined;
+        if (oldest === undefined) break;
+        poseBySequenceRef.current.delete(oldest);
       }
-    }, 100);
-    return () => clearInterval(timer);
-  }, []);
+      recordLog(poseRecord);
+      if (setupRef.current.phase === 'running') {
+        const nextPoint: PathPoint = {
+          x: roverPose.x,
+          y: roverPose.y,
+          spraying: Boolean(telemetryRef.current && (telemetryRef.current.flags & 1)),
+        };
+        setPath((previous) => shouldRecord(previous.at(-1), nextPoint)
+          ? [...previous.slice(-(MAX_PATH_POINTS - 1)), nextPoint]
+          : previous);
+      }
+    } catch (error) {
+      void handleMissionFault(`pose packet failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [vio.validatedPose, vio.trackingOk]);
+
+  async function onSaveCalibration(value: CalibrationFormValue) {
+    setBusy(true);
+    setOperationError(null);
+    try {
+      if (controlRef.current) {
+        await controlRef.current.stop().catch(() => {});
+        await releaseMissionResources(true);
+      }
+      const record = createCalibration({
+        schemaVersion: 1,
+        hardwareTag: HARDWARE_TAG,
+        createdAtIso: new Date().toISOString(),
+        ...value,
+        condition: setup.wet ? 'wet' : 'dry',
+      });
+      await saveCalibration(record, HARDWARE_TAG);
+      setCalibration(record);
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'ready' });
+      setCalibrationProgress(`Phone calibration ${record.id} saved. Run dry steering, speed, and reverse checks for this ID.`);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function awaitCalibrationResult(): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        calibrationWaiterRef.current = null;
+        reject(new Error('Calibration result timeout; Stop and inspect rover logs.'));
+      }, 25000);
+      calibrationWaiterRef.current = { resolve, reject, timer };
+    });
+  }
+
+  async function onRunCalibration(opcode: 5 | 6 | 7) {
+    setBusy(true);
+    setOperationError(null);
+    try {
+      if (setup.wet) throw new Error('Select Dry diagnostic before any calibration movement.');
+      if (!calibration) throw new Error('Save mount and pavement calibration before motion calibration.');
+      const { control } = await ensureMissionResources();
+      if (!calibrationPreparedRef.current) {
+        await control.prepareCalibration(calibration);
+        calibrationPreparedRef.current = true;
+      }
+      const beforeSequence = lastPoseOfferedSequenceRef.current;
+      const deadline = Date.now() + 750;
+      while (lastPoseOfferedSequenceRef.current <= beforeSequence && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const result = awaitCalibrationResult();
+      try {
+        await control.runCalibrationStep(opcode);
+        setCalibrationProgress(await result);
+      } catch (error) {
+        const waiter = calibrationWaiterRef.current;
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          calibrationWaiterRef.current = null;
+        }
+        throw error;
+      }
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onSelfTest() {
+    setBusy(true);
+    setOperationError(null);
+    try {
+      if (setup.wet) throw new Error('Select Dry diagnostic before the self-test.');
+      if (!calibration) throw new Error('Save mount and pavement calibration before the self-test.');
+      const { control } = await ensureMissionResources();
+      if (!calibrationPreparedRef.current) {
+        await control.prepareCalibration(calibration);
+        calibrationPreparedRef.current = true;
+      }
+      const result = new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          selfTestWaiterRef.current = null;
+          reject(new Error('Self-test result timeout; press Stop and inspect rover logs.'));
+        }, 30000);
+        selfTestWaiterRef.current = { resolve, reject, timer };
+      });
+      try {
+        await control.selfTest();
+        setCalibrationProgress(await result);
+      } catch (error) {
+        const waiter = selfTestWaiterRef.current;
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          selfTestWaiterRef.current = null;
+        }
+        throw error;
+      }
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onArm() {
+    setBusy(true);
+    setOperationError(null);
+    try {
+      const { control } = await ensureMissionResources();
+      const candidate = setupReducer({
+        ...setup,
+        loggingReady: Boolean(loggerRef.current) || !setup.wet,
+      }, { type: 'REQUEST_ARM' });
+      if (candidate.phase !== 'arming') {
+        throw new Error(candidate.validationError ?? 'Readiness checks did not pass.');
+      }
+      dispatch({ type: 'REQUEST_ARM' });
+      if (!setup.rectangle) throw new Error('Rectangle is missing.');
+      const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+      await control.configure(setup.rectangle, wire);
+      rectangleConfiguredRef.current = true;
+      await control.arm();
+      dispatch({ type: 'ARM_ACKNOWLEDGED' });
+      recordLog({ type: 'state', phoneMs: Date.now(), state: 'ARMED' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Arm' });
+      else dispatch({ type: 'MISSION_FAULT', cause: message });
+      await handleMissionFault(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onStart() {
+    const control = controlRef.current;
+    if (!control) return;
+    setBusy(true);
+    setOperationError(null);
+    dispatch({ type: 'REQUEST_START' });
+    try {
+      await control.start();
+      dispatch({ type: 'START_ACKNOWLEDGED' });
+      recordLog({ type: 'state', phoneMs: Date.now(), state: 'RUNNING' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Start' });
+      else dispatch({ type: 'MISSION_FAULT', cause: message });
+      await handleMissionFault(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onStop() {
+    setBusy(true);
+    setOperationError(null);
+    try {
+      if (controlRef.current) await controlRef.current.stop();
+      else if (setup.connectionStatus === 'connected') await ble.emergencyStop();
+      recordLog({ type: 'state', phoneMs: Date.now(), state: 'STOPPED' });
+    } catch (error) {
+      setOperationError(`Stop acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      dispatch({ type: 'STOP' });
+      await releaseMissionResources(true);
+      setTelemetry(null);
+      telemetryRef.current = null;
+      setPath([]);
+      setBusy(false);
+    }
+  }
+
+  async function onExport(log: MissionLogFile, format: 'jsonl' | 'csv') {
+    setOperationError(null);
+    try {
+      if (format === 'jsonl') {
+        await exportMissionLog(log.uri);
+        return;
+      }
+      const source = new File(log.uri);
+      const csv = missionJsonlToCsv(await source.text());
+      const output = new File(Paths.document, 'SafeSpread', 'exports', log.name.replace(/\.jsonl$/i, '.csv'));
+      output.create({ intermediates: true, overwrite: true });
+      output.write(csv);
+      await exportMissionLog(output.uri);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  const trackingDetail = vio.trackingState === 'limited'
+    ? `tracking limited: ${vio.trackingReason}`
+    : `tracking ${vio.trackingState}`;
+  const showMission = Boolean(setup.rectangle && ['running', 'complete', 'fault'].includes(setup.phase));
+
+  if (showMission && setup.rectangle) {
+    return (
+      <RunningMission
+        phase={setup.phase}
+        pose={rectanglePose}
+        trackingDetail={trackingDetail}
+        telemetry={telemetry}
+        rectangle={setup.rectangle}
+        path={path}
+        fault={setup.fault ?? operationError}
+        logName={logName}
+        faultDumpReady={Boolean(faultDumpUri)}
+        busy={busy}
+        onStop={onStop}
+        onDownloadFault={async () => {
+          if (faultDumpUri) await exportMissionLog(faultDumpUri);
+        }}
+      />
+    );
+  }
 
   return (
-    <View style={[styles.container, spraying && styles.containerSpraying]}>
-      <View style={styles.hud}>
-        <Text style={styles.text}>X: {pose ? `${pose.x.toFixed(1)} ft` : '—'}</Text>
-        <Text style={styles.text}>Y: {pose ? `${pose.y.toFixed(1)} ft` : '—'}</Text>
-        <Text style={styles.text}>Hdg: {pose ? `${pose.heading.toFixed(0)}°` : '—'}</Text>
-        <Text style={styles.text}>BLE: {status}</Text>
-        <Text style={styles.text}>
-          Tracking: {trackingState}
-          {trackingOk ? '' : ' (not sending)'}
-        </Text>
-        <Text style={styles.text}>Sent: {sentCount}</Text>
-      </View>
-
-      <View style={styles.areaPanel}>
-        <Text style={styles.label}>
-          Rectangle (ft) — M: pass length, N: coverage width to the right
-        </Text>
-        <View style={styles.areaRow}>
-          <TextInput
-            style={styles.input}
-            value={mText}
-            onChangeText={setMText}
-            keyboardType="decimal-pad"
-            placeholder="M"
-            placeholderTextColor="#888"
-          />
-          <Text style={styles.times}>×</Text>
-          <TextInput
-            style={styles.input}
-            value={nText}
-            onChangeText={setNText}
-            keyboardType="decimal-pad"
-            placeholder="N"
-            placeholderTextColor="#888"
-          />
-          <Pressable
-            style={({ pressed }) => [styles.areaButton, pressed && styles.pressed]}
-            onPress={applyArea}
-          >
-            <Text style={styles.buttonText}>Set</Text>
-          </Pressable>
-        </View>
-        {areaNote ? <Text style={styles.note}>{areaNote}</Text> : null}
-      </View>
-
-      <View style={styles.roverPanel}>
-        <Text style={styles.label}>Rover</Text>
-        <Text style={styles.telemetry}>{telemetry || 'no telemetry yet'}</Text>
-        <ScrollView
-          style={styles.logScroll}
-          ref={logRef}
-          onContentSizeChange={() => logRef.current?.scrollToEnd({ animated: false })}
-        >
-          {log.map((line, idx) => (
-            <Text key={idx} style={styles.logLine}>
-              {line}
-            </Text>
-          ))}
-        </ScrollView>
-      </View>
-      <View style={styles.modeRow}>
-        <Pressable
-          style={({ pressed }) => [
-            styles.modeButton,
-            dryRun ? styles.modeDry : styles.modeWet,
-            pressed && styles.pressed,
-          ]}
-          onPress={() => ble.sendCommand('4')}
-        >
-          <Text style={styles.buttonText}>
-            {dryRun ? 'DRY RUN — no spray' : 'WET — spraying enabled'}
-          </Text>
-        </Pressable>
-      </View>
-      <View style={styles.buttons}>
-        <Pressable
-          disabled={running || !pose || !trackingOk}
-          style={({ pressed }) => [
-            styles.button,
-            (running || !pose || !trackingOk) && styles.disabled,
-            pressed && styles.pressed,
-          ]}
-          onPress={() => {
-            if (!pose || !trackingOk) return;
-            let definition: RectangleDefinition;
-            try {
-              definition = defineEnteredRectangle(
-                pose,
-                parseFloat(mText),
-                parseFloat(nText),
-                'right',
-                0,
-                0,
-              );
-            } catch {
-              setAreaNote('Enter positive M and N dimensions before starting');
-              return;
-            }
-            // The old trace belongs to the previous run; rectangle-frame
-            // coordinates are established by setup, not by this pose hook.
-            setPath([]);
-            setActiveRectangle(definition);
-            ble.sendCommand('1');
-          }}
-        >
-          <Text style={styles.buttonText}>{running ? 'Running…' : 'Start'}</Text>
-        </Pressable>
-        <Pressable
-          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
-          onPress={() => ble.sendCommand('2')}
-        >
-          <Text style={styles.buttonText}>Stop</Text>
-        </Pressable>
-        <Pressable
-          style={({ pressed }) => [styles.testButton, pressed && styles.pressed]}
-          onPress={() => ble.sendCommand('3')}
-        >
-          <Text style={styles.buttonText}>Self Test</Text>
-        </Pressable>
-        <Pressable
-          style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}
-          onPress={() => setMapOpen(true)}
-        >
-          <Text style={styles.buttonText}>Map</Text>
-        </Pressable>
-      </View>
-
-      {activeRectangle ? (
-        <PathMap
-          visible={mapOpen}
-          onClose={() => setMapOpen(false)}
-          definition={activeRectangle}
-          points={path}
-        />
-      ) : null}
-    </View>
+    <SetupWizard
+      state={setup}
+      roverPose={vio.pose}
+      cameraPose={vio.validatedPose?.camera ?? null}
+      trackingDetail={trackingDetail}
+      readinessReason={vio.readiness.reason}
+      calibration={calibration}
+      recentLogs={recentLogs}
+      busy={busy}
+      calibrationProgress={operationError ?? calibrationProgress}
+      dispatch={dispatch}
+      onSaveCalibration={onSaveCalibration}
+      onRunCalibration={onRunCalibration}
+      onSelfTest={onSelfTest}
+      onArm={onArm}
+      onStart={onStart}
+      onStop={onStop}
+      onExport={onExport}
+    />
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: 'black' },
-  containerSpraying: { backgroundColor: '#b00020' },
-  hud: { position: 'absolute', top: 60, left: 20 },
-  // Pressed feedback: buttons dim while a finger is down.
-  pressed: { opacity: 0.6 },
-  disabled: { backgroundColor: '#444' },
-  areaPanel: {
-    position: 'absolute',
-    top: 200,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    padding: 12,
-    borderRadius: 8,
-  },
-  label: { color: 'white', fontSize: 14, fontWeight: '600', marginBottom: 8 },
-  areaRow: { flexDirection: 'row', alignItems: 'center' },
-  input: {
-    flex: 1,
-    backgroundColor: '#222',
-    color: 'white',
-    fontSize: 16,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 6,
-  },
-  times: { color: 'white', fontSize: 18, marginHorizontal: 8 },
-  areaButton: {
-    backgroundColor: '#1565c0',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 6,
-    marginLeft: 10,
-  },
-  note: { color: '#9ecbff', fontSize: 13, marginTop: 8 },
-  roverPanel: {
-    position: 'absolute',
-    top: 330,
-    bottom: 164,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    padding: 12,
-    borderRadius: 8,
-  },
-  telemetry: {
-    color: '#7fffa0',
-    fontSize: 13,
-    fontFamily: 'Menlo',
-    marginBottom: 8,
-  },
-  logScroll: { flex: 1 },
-  logLine: { color: '#ddd', fontSize: 12, fontFamily: 'Menlo', marginBottom: 2 },
-  text: { color: 'white', fontSize: 18, fontWeight: '600' },
-  buttons: {
-    position: 'absolute',
-    bottom: 40,
-    left: 20,
-    right: 20,
-    flexDirection: 'row',
-    gap: 10,
-  },
-  // Equal widths so the row stays balanced regardless of label length
-  // ("Start" vs "Running…" vs "Self Test").
-  button: {
-    flex: 1,
-    backgroundColor: '#2e7d32',
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  testButton: {
-    flex: 1,
-    backgroundColor: '#1565c0',
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  mapButton: {
-    flex: 1,
-    backgroundColor: '#455a64',
-    paddingVertical: 14,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  modeRow: {
-    position: 'absolute',
-    bottom: 104,
-    left: 20,
-    right: 20,
-  },
-  modeButton: { paddingVertical: 12, borderRadius: 8, alignItems: 'center' },
-  modeDry: { backgroundColor: '#6a1b9a' },
-  modeWet: { backgroundColor: '#ef6c00' },
-  buttonText: { color: 'white', fontSize: 16, fontWeight: '700' },
-});

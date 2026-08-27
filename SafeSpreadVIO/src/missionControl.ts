@@ -46,6 +46,7 @@ export class MissionControl {
   private readonly dryMode: boolean;
   private readonly preferForwardOnly: boolean;
   private calibrationId = 0;
+  private preparedCalibration: CalibrationWire | null = null;
 
   constructor(
     private readonly transport: MissionTransport,
@@ -71,17 +72,20 @@ export class MissionControl {
     if (this.currentState !== 'idle') throw new Error('mission must be idle before configure');
     return this.exclusive(async () => {
       this.calibrationId = calibration.id;
-      const calibrationCommandId = this.takeCommandId();
-      const calibrationAck = await this.sendAndWait(buildCalibrationV2({
-        flags: 0,
-        epoch: this.epoch,
-        commandId: calibrationCommandId,
-        calibrationId: calibration.id,
-        sprayForwardFt: calibration.sprayForwardFt,
-        sprayRightFt: calibration.sprayRightFt,
-        schemaVersion: calibration.schemaVersion,
-      }), calibrationCommandId);
-      this.requireAck(calibrationAck, [0, 1], calibration.id);
+      if (!this.samePreparedCalibration(calibration)) {
+        const calibrationCommandId = this.takeCommandId();
+        const calibrationAck = await this.sendAndWait(buildCalibrationV2({
+          flags: 0,
+          epoch: this.epoch,
+          commandId: calibrationCommandId,
+          calibrationId: calibration.id,
+          sprayForwardFt: calibration.sprayForwardFt,
+          sprayRightFt: calibration.sprayRightFt,
+          schemaVersion: calibration.schemaVersion,
+        }), calibrationCommandId);
+        this.requireAck(calibrationAck, [0, 1], calibration.id);
+        this.preparedCalibration = { ...calibration };
+      }
 
       const rectangleCommandId = this.takeCommandId();
       const flags = (definition.side === 'left' ? 1 : 0) |
@@ -103,6 +107,49 @@ export class MissionControl {
     });
   }
 
+  async prepareCalibration(calibration: CalibrationWire): Promise<AckV2> {
+    if (this.currentState !== 'idle') throw new Error('mission must be idle before calibration setup');
+    return this.exclusive(async () => {
+      this.calibrationId = calibration.id;
+      const commandId = this.takeCommandId();
+      const acknowledgement = await this.sendAndWait(buildCalibrationV2({
+        flags: 0,
+        epoch: this.epoch,
+        commandId,
+        calibrationId: calibration.id,
+        sprayForwardFt: calibration.sprayForwardFt,
+        sprayRightFt: calibration.sprayRightFt,
+        schemaVersion: calibration.schemaVersion,
+      }), commandId);
+      this.requireAck(acknowledgement, [0], calibration.id);
+      this.preparedCalibration = { ...calibration };
+      return acknowledgement;
+    });
+  }
+
+  async runCalibrationStep(opcode: 5 | 6 | 7): Promise<AckV2> {
+    if (!this.dryMode) throw new Error('calibration motion is dry-only');
+    if (this.currentState !== 'idle' || !this.preparedCalibration) {
+      throw new Error('calibration must be prepared while idle');
+    }
+    if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required for calibration');
+    return this.command(opcode, [0], 'idle');
+  }
+
+  async selfTest(): Promise<AckV2> {
+    if (this.currentState !== 'idle' || !this.preparedCalibration) {
+      throw new Error('calibration epoch must be prepared before self-test');
+    }
+    return this.command(4, [0], 'idle');
+  }
+
+  async dumpFault(): Promise<AckV2> {
+    if (this.currentState !== 'idle' && this.currentState !== 'fault') {
+      throw new Error('Stop before requesting the fault dump');
+    }
+    return this.command(8, [0, 5], this.currentState, false);
+  }
+
   async arm(): Promise<AckV2> {
     if (this.currentState !== 'configured') throw new Error('mission must be configured before arm');
     if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required before arm');
@@ -118,6 +165,8 @@ export class MissionControl {
     let acknowledgement: AckV2 | null = null;
     try {
       acknowledgement = await this.command(3, [0], 'idle', false);
+      this.preparedCalibration = null;
+      this.calibrationId = 0;
       return acknowledgement;
     } finally {
       try {
@@ -168,6 +217,14 @@ export class MissionControl {
     const id = this.nextCommandId;
     this.nextCommandId = this.nextCommandId === 0xffffffff ? 1 : this.nextCommandId + 1;
     return id;
+  }
+
+  private samePreparedCalibration(calibration: CalibrationWire): boolean {
+    const prepared = this.preparedCalibration;
+    return Boolean(prepared && prepared.id === calibration.id &&
+      prepared.schemaVersion === calibration.schemaVersion &&
+      prepared.sprayForwardFt === calibration.sprayForwardFt &&
+      prepared.sprayRightFt === calibration.sprayRightFt);
   }
 
   private receiveAck(packet: Uint8Array): void {
