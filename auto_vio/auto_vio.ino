@@ -236,7 +236,7 @@ const float PURSUIT_GAIN      = 16.0f;   // us of steering per degree of error
 // quicker but works the steering harder against position noise; 1.5 ft closes
 // a foot of error in about 6 ft of travel without ever crossing the line.
 const float LINE_DISTANCE_CONST_FT = 1.5f;
-const int   ROUTE_SEARCH_WINDOW = 80;
+const int   ROUTE_SEARCH_WINDOW = ROUTE_PROGRESS_SEARCH_WINDOW;
 const float CUSP_TOL_FT       = 0.5f;
 
 bool escReverse = false;

@@ -35,6 +35,16 @@ struct RoutePoint {
 
 const float ROUTE_STEP_FT = 0.5f;
 
+// advanceRouteIndex searches no more than this many points per control update.
+// Telemetry/replay can therefore detect a backward index or a forward jump the
+// production tracker itself could not have produced in one accepted sample.
+constexpr int ROUTE_PROGRESS_SEARCH_WINDOW = 80;
+
+inline bool routeIndexAdvanceIsPossible(uint16_t previous, uint16_t current) {
+  return current >= previous &&
+         static_cast<uint32_t>(current - previous) <= ROUTE_PROGRESS_SEARCH_WINDOW;
+}
+
 // Straight run-up outside the rectangle at each end of a pass. The tracker
 // aims a lookahead ahead of itself, so without this it starts easing into the
 // turn before it has finished the pass and the last stretch goes unsprayed --

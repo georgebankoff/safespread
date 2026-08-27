@@ -6,4 +6,5 @@ for t in nav_test parse_test turn_test route_test headland_test circle_fit_test 
   g++ -std=c++17 -I. -o "$out/$t" "$t.cpp"
   "$out/$t"
 done
+./replay_test.sh "$out"
 echo "--- all host tests passed ---"

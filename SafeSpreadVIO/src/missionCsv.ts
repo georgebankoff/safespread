@@ -43,6 +43,14 @@ function csvCell(value: unknown): string {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+function recordValue(
+  record: Record<string, unknown>,
+  column: (typeof MISSION_CSV_COLUMNS)[number],
+): unknown {
+  if (column === 'fault') return record.fault ?? record.faultCode;
+  return record[RECORD_KEYS[column]];
+}
+
 export function missionJsonlToCsv(jsonl: string): string {
   const records: Record<string, unknown>[] = [];
   jsonl.split(/\r?\n/).forEach((line, index) => {
@@ -61,7 +69,7 @@ export function missionJsonlToCsv(jsonl: string): string {
   });
 
   const rows = records.map((record) => MISSION_CSV_COLUMNS
-    .map((column) => csvCell(record[RECORD_KEYS[column]]))
+    .map((column) => csvCell(recordValue(record, column)))
     .join(','));
   return `${MISSION_CSV_COLUMNS.join(',')}\n${rows.length ? `${rows.join('\n')}\n` : ''}`;
 }

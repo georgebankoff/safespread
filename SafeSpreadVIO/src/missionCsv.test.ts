@@ -22,6 +22,18 @@ describe('missionJsonlToCsv', () => {
     expect(csv).toContain('"bad, ""sensor""\nretry"');
   });
 
+  it('exports a firmware fault-buffer code through the replay fault column', () => {
+    const csv = missionJsonlToCsv(JSON.stringify({
+      type: 'fault_buffer', phoneMs: 100, sequence: 2, epoch: 42,
+      speedFps: 1.1, routeIndex: 7, crossTrackFt: 0.2,
+      headingErrorDeg: 1.5, steeringUs: 1700, throttleUs: 1600,
+      faultCode: 9,
+    }));
+    expect(csv.trimEnd().split('\n')[1]).toBe(
+      '100,2,42,,,,1.1,,,7,0.2,1.5,1700,1600,9',
+    );
+  });
+
   it('rejects malformed JSONL and non-object records with their line number', () => {
     expect(() => missionJsonlToCsv('{"type":"pose"}\n{bad')).toThrow('line 2');
     expect(() => missionJsonlToCsv('[]')).toThrow('line 1');
