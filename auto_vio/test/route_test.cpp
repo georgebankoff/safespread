@@ -1,6 +1,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include "../headland.h"
 #include "../route.h"
 
 static const float BAR     = 17.0f / 12.0f;
@@ -30,7 +32,7 @@ static float appliedKappa(float commandUs) {
 // Drive a simulated Ackermann rover, with the rover's real asymmetric radii,
 // along the whole plan -- reversing legs included. This is the part that used
 // to fail on grass with no way to see why.
-static void simulateFollow(float field, const char *label) {
+static void simulatePrepared(float field, const char *label, int n) {
   const float STEP           = 0.15f;   // ft per tick
   const float LINE_T         = 1.5f;    // straight-run convergence constant
   const float LOOKAHEAD_TURN = 1.0f;    // shorter than the tightest radius
@@ -39,7 +41,6 @@ static void simulateFollow(float field, const char *label) {
   const float SPRAY_OFF      = 1.5f;
   const float SPRAY_OFF_1ST  = 3.0f;
 
-  int n = buildRoute(field, field, BAR, OVERLAP, RL, RR, sim, 6000);
   int lanes = laneCount(field, BAR, OVERLAP);
   assert(n > 20);
 
@@ -49,6 +50,8 @@ static void simulateFollow(float field, const char *label) {
   float x = sim[0].x, y = sim[0].y, heading = 0.0f;
   int idx = 0, ticks = 0, stuck = 0;
   float worstOff = 0.0f, worstStraight = 0.0f;
+  int worstStraightIdx = 0;
+  float worstStraightX = x, worstStraightY = y;
   bool firstPassGap = false;
   float sprayedFt = 0.0f;
 
@@ -93,6 +96,9 @@ static void simulateFollow(float field, const char *label) {
     // strips land side by side or on top of each other.
     if (sim[idx].spray && fabsf(crossNow) > worstStraight) {
       worstStraight = fabsf(crossNow);
+      worstStraightIdx = idx;
+      worstStraightX = x;
+      worstStraightY = y;
     }
 
     float limit = (idx < firstPassEnd) ? SPRAY_OFF_1ST : SPRAY_OFF;
@@ -110,6 +116,14 @@ static void simulateFollow(float field, const char *label) {
   assert(worstOff < 1.5f);       // never wandered far from it
   assert(!firstPassGap);         // first pass sprayed end to end
 
+  if (worstStraight >= 0.5f * laneSpacing(BAR, OVERLAP)) {
+    std::printf("route_test: %s excessive spray error %.2f ft at point %d "
+                "(actual %.2f,%.2f target %.2f,%.2f)\n",
+                label, worstStraight, worstStraightIdx,
+                worstStraightX, worstStraightY,
+                sim[worstStraightIdx].x, sim[worstStraightIdx].y);
+  }
+
   // While spraying, the rover must stay inside half a lane width of its line.
   // Beyond that, neighbouring strips start landing on top of each other --
   // which is what "it drives back over what it just covered" looks like.
@@ -121,6 +135,11 @@ static void simulateFollow(float field, const char *label) {
   printf("route_test: %s -> %d ticks, worst %.2f ft off plan, "
          "%.2f ft sideways while spraying, sprayed %.0f/%.0f ft\n",
          label, ticks, worstOff, worstStraight, sprayedFt, wanted);
+}
+
+static void simulateFollow(float field, const char *label) {
+  int n = buildRoute(field, field, BAR, OVERLAP, RL, RR, sim, 6000);
+  simulatePrepared(field, label, n);
 }
 
 int main() {
@@ -267,6 +286,60 @@ int main() {
   simulateFollow(FIELD, "real field");
   simulateFollow(10.0f, "10x10");
   simulateFollow(6.0f, "6x6");
+
+  // --- prefer a continuous forward route when the pavement fits -----------
+  {
+    static RoutePoint selected[6000];
+    RouteSelection forward = selectRoute(
+        FIELD, FIELD, BAR, OVERLAP, RL, RR,
+        100.0f, 100.0f, true, selected, 6000);
+    assert(forward.style == ROUTE_FORWARD_ONLY);
+    assert(forward.count > 0 && !forward.requirements.truncated);
+    assert(forward.requirements.reversals == 0);
+    float forwardMinX = selected[0].x, forwardMaxX = selected[0].x;
+    for (int i = 1; i < forward.count; ++i) {
+      if (selected[i].x < forwardMinX) forwardMinX = selected[i].x;
+      if (selected[i].x > forwardMaxX) forwardMaxX = selected[i].x;
+    }
+    std::printf("route_test: forward-only -> %d points, needs %.1f/%.1f ft headland, x %.1f..%.1f\n",
+                forward.count, forward.requirements.beforeStartFt,
+                forward.requirements.beyondEndFt, forwardMinX, forwardMaxX);
+    for (int i = 0; i < forward.count; ++i) assert(!selected[i].reverse);
+
+    // The far-lane ordering changes visit order, never lane placement: every
+    // lane at the unchanged 15% overlap spacing still receives a full pass.
+    for (int lane = 0; lane < lanes; ++lane) {
+      const float laneX = laneCenterX(lane, BAR, OVERLAP);
+      bool covered = false;
+      for (int i = 0; i < forward.count; ++i) {
+        if (selected[i].spray && std::fabs(selected[i].x - laneX) < 0.05f) {
+          covered = true;
+          break;
+        }
+      }
+      assert(covered);
+    }
+
+    // Exercise the selected forward-only plan through the same tracker model
+    // as the reversing route. Geometry alone cannot prove that its longer
+    // Dubins transitions remain followable by the production control law.
+    std::memcpy(sim, selected, forward.count * sizeof(RoutePoint));
+    simulatePrepared(FIELD, "forward-only", forward.count);
+
+    static RoutePoint kturn[6000];
+    int kCount = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, kturn, 6000);
+    RouteRequirements kNeeds = inspectRoute(kturn, kCount, FIELD);
+    assert(forward.requirements.beforeStartFt > kNeeds.beforeStartFt + 0.01f ||
+           forward.requirements.beyondEndFt > kNeeds.beyondEndFt + 0.01f);
+
+    RouteSelection fallback = selectRoute(
+        FIELD, FIELD, BAR, OVERLAP, RL, RR,
+        kNeeds.beforeStartFt, kNeeds.beyondEndFt,
+        true, selected, 6000);
+    assert(fallback.style == ROUTE_THREE_POINT);
+    assert(fallback.count == kCount);
+    assert(fallback.requirements.reversals > 0);
+  }
 
   printf("route_test: all assertions passed\n");
   return 0;

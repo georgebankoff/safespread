@@ -23,6 +23,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include "fault_buffer.h"
+#include "headland.h"
 #include "mission_protocol.h"
 #include "nav_math.h"
 #include "protocol_v2.h"
@@ -183,11 +184,14 @@ FaultSummaryPersistence<PreferencesFaultStore> faultSummary(faultStore, FAULT_SU
 FaultSummary bootFaultSummary = {};
 bool hasBootFaultSummary = false;
 
-const int MAX_ROUTE_POINTS = 2600;
+const int MAX_ROUTE_POINTS = 6000;
 RoutePoint route[MAX_ROUTE_POINTS];
 int routeCount = 0;
 int routeIndex = 0;
 int firstPassEnd = 0;      // route index where the all-important first pass ends
+RouteStyle routeStyle = ROUTE_NONE;
+RouteRequirements routeRequirements = {};
+FaultCode routePlanningFault = F_ROUTE;
 
 // Steer at a point this far ahead on the path. On a straight pass a long
 // lookahead tracks smoothly; through a turn it must be shorter than the arc's
@@ -866,10 +870,19 @@ void learnSteeringTrim(float offPlanFt) {
 }
 
 void planRoute() {
-  routeCount = buildRoute(fieldPassFt, fieldWidthFt, BAR_WIDTH_FT,
-                          LANE_OVERLAP_FRACTION,
-                          turnRadiusLeftFt, turnRadiusRightFt,
-                          route, MAX_ROUTE_POINTS);
+  const protocol_v2::RectangleV2 &rectangle = mission.rectangle();
+  const bool preferForwardOnly = (rectangle.flags & 0x04) != 0;
+  const RouteSelection selection = selectRoute(
+      fieldPassFt, fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION,
+      turnRadiusLeftFt, turnRadiusRightFt,
+      rectangle.startClearFt, rectangle.endClearFt,
+      preferForwardOnly, route, MAX_ROUTE_POINTS);
+  routeCount = selection.count;
+  routeStyle = selection.style;
+  routeRequirements = selection.requirements;
+  routePlanningFault = routeStyle == ROUTE_NONE
+      ? (routeRequirements.truncated ? F_ROUTE : F_HEADLAND)
+      : F_NONE;
   routeIndex = 0;
   lastRouteIndex = -1;
   targetDistanceValid = false;
@@ -898,14 +911,21 @@ void planRoute() {
   }
 
   bleLog("Planned " + String(routeCount) + " pts, " + String(lanes) +
-         " lanes, " + String(reversals) + " direction changes.");
+         " lanes, " + String(reversals) + " direction changes (" +
+         String(routeStyle == ROUTE_FORWARD_ONLY ? "forward-only" :
+                routeStyle == ROUTE_THREE_POINT ? "three-point" : "none") + ").");
   bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
          String(turnRadiusRightFt, 2) + " ft, straight-ahead at " +
          String((int)steerCentreUs()) + "us.");
-  bleLog("Needs clear ground " + String(maxY - fieldPassFt, 1) + " ft past the far end, " +
-         String(-minY, 1) + " ft behind the start.");
+  bleLog("Needs clear pavement " + String(routeRequirements.beyondEndFt, 1) +
+         " ft past the far end, " + String(routeRequirements.beforeStartFt, 1) +
+         " ft behind the start.");
 
-  if (routeCount >= MAX_ROUTE_POINTS) {
+  if (routeStyle == ROUTE_NONE && routePlanningFault == F_HEADLAND) {
+    bleLog("!! Neither forward-only nor three-point turns fit the entered clear pavement.");
+  }
+
+  if (routeRequirements.truncated) {
     bleLog("!! Route hit the point limit; area is too large to plan fully.");
   }
 }
@@ -1147,9 +1167,9 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         setSpray(false);
         announceArea();
         planRoute();
-        if (routeCount < 2 || routeCount >= MAX_ROUTE_POINTS) {
-          enterFault(F_ROUTE);
-          ack = mission.overrideLastSetupWithFault(F_ROUTE);
+        if (routeCount < 2 || routeStyle == ROUTE_NONE) {
+          enterFault(routePlanningFault);
+          ack = mission.overrideLastSetupWithFault(routePlanningFault);
         }
       }
       sendAck(ack);
@@ -1404,9 +1424,9 @@ void loop() {
       false,
       false,
       true,
-      routeCount >= 2 && routeCount < MAX_ROUTE_POINTS,
+      routeCount >= 2 && routeStyle != ROUTE_NONE && !routeRequirements.truncated,
       true,
-      true,
+      routeStyle != ROUTE_NONE,
     };
     FaultCode fault = evaluateSafety(mission.state(), safety);
     if (fault != F_NONE) enterFault(fault);

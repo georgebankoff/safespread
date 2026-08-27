@@ -1,5 +1,6 @@
 #pragma once
 #include "nav_math.h"
+#include "dubins.h"
 #include "turn.h"
 
 // The whole mission, computed once before the rover moves: a dense list of
@@ -26,6 +27,10 @@ struct RoutePoint {
   // instead of following it -- with a 2.9 ft turning circle, the 2.5 ft
   // lookahead that suits a straight pass misses the turn completely.
   bool  turning;
+  // True only on the final point of a fully generated route. A full output
+  // buffer can otherwise look like a valid partial pass, so completion must be
+  // explicit rather than inferred from the last coordinate.
+  bool  terminal;
 };
 
 const float ROUTE_STEP_FT = 0.5f;
@@ -45,6 +50,57 @@ const float HEADLAND_MARGIN_FT = 3.5f;
 // The cost is a slightly longer turn; the benefit is that the rover exits it
 // on the lane it aimed for rather than a foot or two beside it.
 const float TURN_PLANNING_MARGIN = 1.3f;
+const int MAX_FORWARD_LANES = 64;
+
+inline int forwardLaneSkip(float turnRadiusFt, float barWidthFt,
+                           float overlapFraction, int totalLanes) {
+  int skip = static_cast<int>(lroundf(
+      (2.0f * turnRadiusFt) / laneSpacing(barWidthFt, overlapFraction)));
+  if (skip < 1) skip = 1;
+  if (totalLanes > 1 && skip > totalLanes - 1) skip = totalLanes - 1;
+  return skip;
+}
+
+// Ported from the earlier measured-radius navigator: aim a turning diameter
+// away, then switch to the nearest remaining lane when that far landing has
+// already been covered. This deliberately alternates far and near indices;
+// the long jumps make easy U-turns and the short joins are handled by Dubins
+// loops when enough continuous headland exists.
+inline int buildAlternatingFarLaneOrder(int totalLanes, int skip,
+                                        int *out, int maxOut) {
+  if (totalLanes <= 0 || totalLanes > MAX_FORWARD_LANES || maxOut < totalLanes) return 0;
+  bool covered[MAX_FORWARD_LANES] = {};
+  int current = 0;
+  for (int count = 0; count < totalLanes; ++count) {
+    out[count] = current;
+    covered[current] = true;
+    if (count + 1 == totalLanes) return totalLanes;
+
+    int next = current + skip;
+    if (next >= totalLanes || covered[next]) {
+      next = current - skip;
+    }
+    if (next < 0 || next >= totalLanes || covered[next]) {
+      float bestDistance = 1e9f;
+      next = -1;
+      for (int lane = 0; lane < totalLanes; ++lane) {
+        if (covered[lane]) continue;
+        const float distance = fabsf(static_cast<float>(lane - current));
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          next = lane;
+        }
+      }
+    }
+    if (next < 0) return 0;
+    current = next;
+  }
+  return 0;
+}
+
+inline float routeHeadingToMath(float headingDeg) {
+  return (90.0f - headingDeg) * static_cast<float>(M_PI) / 180.0f;
+}
 
 /** Points along a straight line, excluding the start (the previous segment
  *  already ended there) and landing exactly on the end, so consecutive
@@ -64,12 +120,14 @@ inline int emitLineTo(RoutePoint *out, int maxOut, float x1, float y1,
     out[n].spray = spray;
     out[n].reverse = reverse;
     out[n].turning = false;
+    out[n].terminal = false;
     n++;
   }
   if (n < maxOut &&
       (n == 0 || fabsf(out[n - 1].x - x2) > 1e-4f || fabsf(out[n - 1].y - y2) > 1e-4f)) {
     out[n].x = x2; out[n].y = y2; out[n].spray = spray; out[n].reverse = reverse;
     out[n].turning = false;
+    out[n].terminal = false;
     n++;
   }
   return n;
@@ -92,6 +150,7 @@ inline int emitTurn(RoutePoint *out, int maxOut, const TurnPlan &p,
     out[n].spray = false;      // never spray through a turn
     out[n].reverse = rev;
     out[n].turning = true;
+    out[n].terminal = false;
     n++;
   }
   if (n < maxOut) {
@@ -102,6 +161,7 @@ inline int emitTurn(RoutePoint *out, int maxOut, const TurnPlan &p,
     out[n].spray = false;
     out[n].reverse = false;    // the turn always finishes driving forward
     out[n].turning = true;
+    out[n].terminal = false;
     n++;
   }
   return n;
@@ -175,6 +235,94 @@ inline int advanceRouteIndex(const RoutePoint *route, int count, int fromIndex,
   return idx;
 }
 
+/** Build a no-reverse route using the measured-radius far-lane visit order.
+ *  Every transit is a shortest curvature-bounded Dubins path; exact clearance
+ *  is inspected after generation instead of guessed before motion. */
+inline int buildForwardOnlyRoute(float fieldPassFt, float fieldWidthFt,
+                                 float barWidthFt, float overlapFraction,
+                                 float rLeftFt, float rRightFt,
+                                 RoutePoint *out, int maxOut) {
+  const int totalLanes = laneCount(fieldWidthFt, barWidthFt, overlapFraction);
+  if (totalLanes < 1 || totalLanes > MAX_FORWARD_LANES || maxOut < 2) return 0;
+
+  const float radius = fmaxf(rLeftFt, rRightFt) * TURN_PLANNING_MARGIN;
+  int order[MAX_FORWARD_LANES];
+  const int orderCount = buildAlternatingFarLaneOrder(
+      totalLanes, forwardLaneSkip(radius, barWidthFt, overlapFraction, totalLanes),
+      order, MAX_FORWARD_LANES);
+  if (orderCount != totalLanes) return 0;
+
+  int count = 0;
+  int completedLanes = 0;
+  bool haveExit = false;
+  float exitX = 0.0f, exitY = 0.0f, exitHeading = 0.0f;
+
+  for (int visit = 0; visit < orderCount && count < maxOut; ++visit) {
+    const float laneX = laneCenterX(order[visit], barWidthFt, overlapFraction);
+    const bool goesUp = (visit % 2) == 0;
+    const float startY = goesUp ? 0.0f : fieldPassFt;
+    const float endY = goesUp ? fieldPassFt : 0.0f;
+    const float direction = goesUp ? 1.0f : -1.0f;
+    const float heading = goesUp ? 0.0f : 180.0f;
+
+    if (haveExit) {
+      const float approachY = startY - direction * HEADLAND_MARGIN_FT;
+      DubinsPath transit = {};
+      if (!dubinsCompute(exitX, exitY, routeHeadingToMath(exitHeading),
+                         laneX, approachY, routeHeadingToMath(heading),
+                         radius, transit)) {
+        return count;
+      }
+      const float length = dubinsLength(transit);
+      for (float distance = ROUTE_STEP_FT;
+           distance < length && count < maxOut;
+           distance += ROUTE_STEP_FT) {
+        float x, y, theta;
+        dubinsPoseAt(transit, distance, x, y, theta);
+        out[count] = {x, y, false, false, true, false};
+        count++;
+      }
+      if (count >= maxOut) break;
+      out[count] = {laneX, approachY, false, false, true, false};
+      count++;
+      count += emitLineTo(out + count, maxOut - count,
+                          laneX, approachY, laneX, startY, false, false);
+      if (count <= 0 || fabsf(out[count - 1].x - laneX) > 1e-4f ||
+          fabsf(out[count - 1].y - startY) > 1e-4f) {
+        break;
+      }
+    }
+
+    if (count >= maxOut) break;
+    out[count] = {laneX, startY, true, false, false, false};
+    count++;
+    count += emitLineTo(out + count, maxOut - count,
+                        laneX, startY, laneX, endY, true, false);
+    if (count <= 0 || fabsf(out[count - 1].x - laneX) > 1e-4f ||
+        fabsf(out[count - 1].y - endY) > 1e-4f || !out[count - 1].spray) {
+      break;
+    }
+    completedLanes++;
+
+    if (visit + 1 < orderCount) {
+      const float runoutY = endY + direction * HEADLAND_MARGIN_FT;
+      count += emitLineTo(out + count, maxOut - count,
+                          laneX, endY, laneX, runoutY, false, false);
+      if (count <= 0 || fabsf(out[count - 1].x - laneX) > 1e-4f ||
+          fabsf(out[count - 1].y - runoutY) > 1e-4f) {
+        break;
+      }
+      exitX = laneX;
+      exitY = runoutY;
+      exitHeading = heading;
+      haveExit = true;
+    }
+  }
+
+  if (count > 0 && completedLanes == totalLanes) out[count - 1].terminal = true;
+  return count;
+}
+
 /** Emit the full route. `rLeftFt` and `rRightFt` are the rover's two turning
  *  radii, carried separately because they are not the same size. Returns the
  *  number of points written. */
@@ -193,8 +341,9 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
   // lined up on.
   int n = 0;
   out[n].x = 0.0f; out[n].y = 0.0f; out[n].spray = true;
-  out[n].reverse = false; out[n].turning = false;
+  out[n].reverse = false; out[n].turning = false; out[n].terminal = false;
   n++;
+  int completedLanes = 0;
 
   for (int i = 0; i < lanes && n < maxOut; i++) {
     float laneX  = laneCenterX(i, barWidthFt, overlapFraction);
@@ -214,6 +363,11 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
     }
 
     n += emitLineTo(out + n, maxOut - n, laneX, startY, laneX, endY, true, false);
+    if (n == 0 || fabsf(out[n - 1].x - laneX) > 1e-4f ||
+        fabsf(out[n - 1].y - endY) > 1e-4f || !out[n - 1].spray) {
+      break;
+    }
+    completedLanes++;
 
     if (i + 1 >= lanes) break;
 
@@ -230,6 +384,8 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
     if (!planHeadlandTurn(shift, planLeft, planRight, p)) return n;
     n += emitTurn(out + n, maxOut - n, p, laneX, headlandY, headingDeg);
   }
+
+  if (n > 0 && completedLanes == lanes) out[n - 1].terminal = true;
 
   return n;
 }
