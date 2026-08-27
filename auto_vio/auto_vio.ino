@@ -22,6 +22,7 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <math.h>
+#include "calibration.h"
 #include "direction.h"
 #include "fault_buffer.h"
 #include "headland.h"
@@ -87,17 +88,17 @@ float turnRadiusRightFt = 2.92f;
 // Explicit measured curvature map. Straight is a direct calibration knot,
 // not a midpoint inferred from the two steering endpoints. Runtime control
 // interpolates this table without silently relearning its center.
-const SteeringKnot STEERING_MAP[] = {
+SteeringKnot steeringMap[MAX_CALIBRATION_KNOTS] = {
   {STEER_LEFT_US, -1.0f / 4.33f},
   {1709, 0.0f},
   {STEER_RIGHT_US, 1.0f / 2.92f},
 };
-const int STEERING_MAP_COUNT = sizeof(STEERING_MAP) / sizeof(STEERING_MAP[0]);
+int steeringMapCount = 3;
 bool steeringMapValid = false;
 int  lastSteerCommandUs = 1500;
 
 float steerCentreUs() {
-  const float pulse = pulseForCurvature(STEERING_MAP, STEERING_MAP_COUNT, 0.0f);
+  const float pulse = pulseForCurvature(steeringMap, steeringMapCount, 0.0f);
   return isfinite(pulse) ? pulse : static_cast<float>(STEER_CENTER_US);
 }
 
@@ -180,6 +181,42 @@ FaultSummaryPersistence<PreferencesFaultStore> faultSummary(faultStore, FAULT_SU
 FaultSummary bootFaultSummary = {};
 bool hasBootFaultSummary = false;
 
+constexpr uint32_t HARDWARE_TAG_HASH = 0x89abcdef;
+
+class PreferencesCalibrationStore {
+ public:
+  bool read(uint8_t *out, size_t size) {
+    Preferences prefs;
+    if (!prefs.begin("ss-motion", true)) return false;
+    const bool ok = prefs.getBytesLength("compact") == size &&
+                    prefs.getBytes("compact", out, size) == size;
+    prefs.end();
+    return ok;
+  }
+  bool write(const uint8_t *data, size_t size) {
+    Preferences prefs;
+    if (!prefs.begin("ss-motion", false)) return false;
+    const bool ok = prefs.putBytes("compact", data, size) == size;
+    prefs.end();
+    return ok;
+  }
+};
+
+PreferencesCalibrationStore calibrationStore;
+MotionCalibrationPersistence<PreferencesCalibrationStore> calibrationPersistence(calibrationStore);
+CompactMotionCalibration storedMotionCalibration = {};
+bool hasStoredMotionCalibration = false;
+SteeringCalibrationSample steeringCalibrationSamples[6] = {};
+int steeringCalibrationSampleCount = 0;
+SpeedCalibrationSample forwardSpeedSamples[3] = {};
+int forwardSpeedSampleCount = 0;
+SpeedCalibrationSample reverseSpeedSamples[3] = {};
+int reverseSpeedSampleCount = 0;
+SteeringCalibrationFit pendingSteeringFit = {};
+bool straightCalibrationValidated = false;
+bool reverseCalibrationVerified = false;
+bool calibrationActive = false;
+
 const int MAX_ROUTE_POINTS = 6000;
 RoutePoint route[MAX_ROUTE_POINTS];
 int routeCount = 0;
@@ -207,6 +244,8 @@ bool directionRequested = false;
 DirectionState driveDirection;
 SpeedPI speedController;
 unsigned long lastSpeedControlMs = 0;
+float forwardFeedForwardUs = DRY_FALLBACK_FWD_OFFSET_US;
+float reverseFeedForwardUs = DRY_FALLBACK_REV_OFFSET_US;
 
 // If the rover cannot make measured progress toward its target, fault rather
 // than silently skipping untreated pavement.
@@ -418,6 +457,32 @@ void stopDrive() {
   lastSpeedControlMs = 0;
   setChannelPulse(ESC_CH, NEUTRAL_US);
   setChannelPulse(STEER_CH, (int)steerCentreUs());
+}
+
+void applyMotionCalibration(const CompactMotionCalibration &calibration) {
+  if (!compactCalibrationValid(calibration)) return;
+  steeringMapCount = calibration.knotCount;
+  for (int index = 0; index < steeringMapCount; ++index) {
+    steeringMap[index] = calibration.knots[index];
+  }
+  steeringMapValid = validSteeringMap(steeringMap, steeringMapCount);
+  if (steeringMapValid) {
+    turnRadiusLeftFt = -1.0f / steeringMap[0].curvaturePerFt;
+    turnRadiusRightFt = 1.0f / steeringMap[steeringMapCount - 1].curvaturePerFt;
+  }
+  forwardFeedForwardUs = calibration.forwardFeedForwardUs;
+  reverseFeedForwardUs = calibration.reverseFeedForwardUs;
+}
+
+bool motionCalibrationMatchesMission() {
+  return hasStoredMotionCalibration &&
+         calibrationIdentityMatches(storedMotionCalibration,
+                                    mission.calibration().schemaVersion,
+                                    mission.calibrationId(), HARDWARE_TAG_HASH);
+}
+
+bool motionCalibrationReady() {
+  return steeringMapValid && (dryRunMode || motionCalibrationMatchesMission());
 }
 
 uint16_t saturatedPacketDrops() {
@@ -674,7 +739,7 @@ bool measureDrive(bool reverse, uint32_t generation, float &alongFt) {
   float x0 = robotX_ft, y0 = robotY_ft;
 
   const int pulseUs = NEUTRAL_US + static_cast<int>(
-      reverse ? -DRY_FALLBACK_REV_OFFSET_US : DRY_FALLBACK_FWD_OFFSET_US);
+      reverse ? -reverseFeedForwardUs : forwardFeedForwardUs);
   driveDirection.begin(reverse, reverse, millis(), robotX_ft, robotY_ft,
                        robotHeading, pulseUs, NEUTRAL_US);
   while (!driveDirection.ready() && !driveDirection.failed()) {
@@ -741,6 +806,258 @@ bool runDriveTest(uint32_t generation) {
   stopDrive();
   bleLog("--- DRIVE TEST COMPLETE ---");
   return forwardVerified && reverseVerified;
+}
+
+void resetMotionCalibrationSession() {
+  steeringCalibrationSampleCount = 0;
+  forwardSpeedSampleCount = 0;
+  reverseSpeedSampleCount = 0;
+  pendingSteeringFit = {};
+  straightCalibrationValidated = false;
+  reverseCalibrationVerified = false;
+  memset(steeringCalibrationSamples, 0, sizeof(steeringCalibrationSamples));
+  memset(forwardSpeedSamples, 0, sizeof(forwardSpeedSamples));
+  memset(reverseSpeedSamples, 0, sizeof(reverseSpeedSamples));
+}
+
+bool calibrationCanContinue(uint32_t generation) {
+  return diagnosticCanContinue(generation) && dryRunMode &&
+         mission.poseFresh(millis()) && !safetyEventPending();
+}
+
+bool measureCalibrationTravel(bool reverse, int pulseUs, int steeringPulseUs,
+                              float targetDistanceFt, uint32_t generation,
+                              float &alongFt, float &elapsedSeconds,
+                              float &headingDeltaDeg) {
+  if (!calibrationCanContinue(generation)) return false;
+  setSpray(false);
+  setChannelPulse(STEER_CH, steeringPulseUs);
+  driveDirection.begin(reverse, reverse, millis(), robotX_ft, robotY_ft,
+                       robotHeading, pulseUs, NEUTRAL_US);
+  while (!driveDirection.ready() && !driveDirection.failed()) {
+    pumpBle();
+    if (!calibrationCanContinue(generation)) {
+      stopDrive();
+      return false;
+    }
+    setChannelPulse(STEER_CH, steeringPulseUs);
+    setChannelPulse(ESC_CH,
+                    driveDirection.update(millis(), robotX_ft, robotY_ft));
+    delay(10);
+  }
+  if (!driveDirection.ready()) {
+    stopDrive();
+    return false;
+  }
+
+  const float x0 = robotX_ft, y0 = robotY_ft, heading0 = robotHeading;
+  const float radians = heading0 * (float)M_PI / 180.0f;
+  const unsigned long startedAt = millis();
+  alongFt = 0.0f;
+  while (fabsf(alongFt) < targetDistanceFt && millis() - startedAt < 10000) {
+    pumpBle();
+    if (!calibrationCanContinue(generation)) {
+      stopDrive();
+      return false;
+    }
+    setChannelPulse(STEER_CH, steeringPulseUs);
+    setChannelPulse(ESC_CH,
+                    driveDirection.update(millis(), robotX_ft, robotY_ft));
+    const float dx = robotX_ft - x0, dy = robotY_ft - y0;
+    alongFt = dx * sinf(radians) + dy * cosf(radians);
+    delay(10);
+  }
+  elapsedSeconds = (millis() - startedAt) / 1000.0f;
+  headingDeltaDeg = angleDiffDeg(robotHeading, heading0);
+  const bool signMatches = reverse ? alongFt <= -targetDistanceFt : alongFt >= targetDistanceFt;
+  stopDrive();
+  return signMatches && elapsedSeconds > 0.0f;
+}
+
+bool measureCalibrationArc(int pulseUs, uint32_t generation,
+                           SteeringCalibrationSample &sample) {
+  if (!calibrationCanContinue(generation)) return false;
+  setSpray(false);
+  setChannelPulse(STEER_CH, pulseUs);
+  const int throttleUs = NEUTRAL_US + static_cast<int>(forwardFeedForwardUs);
+  driveDirection.begin(false, false, millis(), robotX_ft, robotY_ft,
+                       robotHeading, throttleUs, NEUTRAL_US);
+  while (!driveDirection.ready() && !driveDirection.failed()) {
+    pumpBle();
+    if (!calibrationCanContinue(generation)) {
+      stopDrive();
+      return false;
+    }
+    setChannelPulse(STEER_CH, pulseUs);
+    setChannelPulse(ESC_CH,
+                    driveDirection.update(millis(), robotX_ft, robotY_ft));
+    delay(10);
+  }
+  if (!driveDirection.ready()) {
+    stopDrive();
+    return false;
+  }
+
+  const float heading0 = robotHeading;
+  float previousX = robotX_ft, previousY = robotY_ft;
+  float distanceFt = 0.0f;
+  float sweptDeg = 0.0f;
+  const unsigned long startedAt = millis();
+  while (fabsf(sweptDeg) < MIN_CALIBRATION_SWEEP_DEG &&
+         millis() - startedAt < 12000) {
+    pumpBle();
+    if (!calibrationCanContinue(generation)) {
+      stopDrive();
+      return false;
+    }
+    setChannelPulse(STEER_CH, pulseUs);
+    setChannelPulse(ESC_CH,
+                    driveDirection.update(millis(), robotX_ft, robotY_ft));
+    const float dx = robotX_ft - previousX, dy = robotY_ft - previousY;
+    const float stepFt = sqrtf(dx * dx + dy * dy);
+    if (stepFt < 1.0f) distanceFt += stepFt;
+    previousX = robotX_ft;
+    previousY = robotY_ft;
+    sweptDeg = angleDiffDeg(robotHeading, heading0);
+    delay(10);
+  }
+  stopDrive();
+  if (fabsf(sweptDeg) < MIN_CALIBRATION_SWEEP_DEG || distanceFt < 3.0f) return false;
+  sample = {pulseUs,
+            sweptDeg * (float)M_PI / 180.0f / distanceFt,
+            fabsf(sweptDeg),
+            +1};
+  return true;
+}
+
+void tryCommitMotionCalibration() {
+  if (!pendingSteeringFit.valid || forwardSpeedSampleCount < 3 ||
+      reverseSpeedSampleCount < 3 || !reverseCalibrationVerified) return;
+  float forwardFit = 0.0f, reverseFit = 0.0f;
+  if (!fitSpeedFeedForward(forwardSpeedSamples, forwardSpeedSampleCount,
+                           +1, NEUTRAL_US, forwardFit) ||
+      !fitSpeedFeedForward(reverseSpeedSamples, reverseSpeedSampleCount,
+                           -1, NEUTRAL_US, reverseFit)) {
+    bleLog("[CAL FAIL] Speed samples are inconsistent.");
+    return;
+  }
+  const CompactMotionCalibration candidate = makeCompactCalibration(
+      mission.calibration().schemaVersion, mission.calibrationId(),
+      HARDWARE_TAG_HASH, pendingSteeringFit, forwardFit, reverseFit, true);
+  if (!calibrationPersistence.save(candidate)) {
+    bleLog("[CAL FAIL] Could not persist compact motion calibration.");
+    return;
+  }
+  storedMotionCalibration = candidate;
+  hasStoredMotionCalibration = true;
+  applyMotionCalibration(storedMotionCalibration);
+  bleLog("[CAL PASS] Motion calibration saved for ID " +
+         String(storedMotionCalibration.calibrationId) + ".");
+}
+
+bool runSteeringCalibrationStep(uint32_t generation) {
+  if (!straightCalibrationValidated) {
+    float along = 0.0f, seconds = 0.0f, headingDelta = 0.0f;
+    const int pulse = NEUTRAL_US + static_cast<int>(forwardFeedForwardUs);
+    bleLog("[CAL STEER] Straight validation: keep 8 ft of pavement clear ahead.");
+    if (!measureCalibrationTravel(false, pulse, static_cast<int>(steerCentreUs()),
+                                  6.0f, generation, along, seconds, headingDelta) ||
+        fabsf(headingDelta) > 2.0f) {
+      bleLog("[CAL FAIL] Direct straight pulse bent more than 2 degrees over 6 ft.");
+      return false;
+    }
+    straightCalibrationValidated = true;
+    bleLog("[CAL PASS] Direct straight pulse verified at " +
+           String(static_cast<int>(steerCentreUs())) + "us.");
+    return true;
+  }
+
+  static const int PULSES[6] = {2300, 2300, 2300, 800, 800, 800};
+  if (steeringCalibrationSampleCount >= 6) {
+    bleLog("[CAL STEER] Steering samples already complete.");
+    return true;
+  }
+  const int pulse = PULSES[steeringCalibrationSampleCount];
+  bleLog("[CAL STEER] Arc " + String(steeringCalibrationSampleCount + 1) +
+         "/6 at " + String(pulse) + "us; keep the sweep area clear.");
+  SteeringCalibrationSample sample = {};
+  if (!measureCalibrationArc(pulse, generation, sample)) {
+    bleLog("[CAL FAIL] Arc did not produce a valid 60 degree sweep.");
+    return false;
+  }
+  steeringCalibrationSamples[steeringCalibrationSampleCount++] = sample;
+  bleLog("[CAL SAMPLE] steer=" + String(pulse) +
+         " curvature=" + String(sample.curvaturePerFt, 4) + " 1/ft.");
+  if (steeringCalibrationSampleCount == 6) {
+    if (!fitSteeringCalibration(steeringCalibrationSamples, 6,
+                                static_cast<int>(steerCentreUs()), pendingSteeringFit)) {
+      bleLog("[CAL FAIL] Steering samples do not form a monotonic two-sided map.");
+      return false;
+    }
+    bleLog("[CAL PASS] Steering map fit is complete.");
+    tryCommitMotionCalibration();
+  }
+  return true;
+}
+
+bool runSpeedCalibrationStep(uint32_t generation) {
+  static const int FORWARD_PULSES[3] = {1610, 1620, 1630};
+  static const int REVERSE_PULSES[3] = {1390, 1380, 1370};
+  const bool reverse = forwardSpeedSampleCount >= 3;
+  int &sampleCount = reverse ? reverseSpeedSampleCount : forwardSpeedSampleCount;
+  if (reverse && sampleCount >= 3) {
+    bleLog("[CAL SPEED] Speed samples already complete.");
+    return true;
+  }
+  const int pulse = reverse ? REVERSE_PULSES[sampleCount] : FORWARD_PULSES[sampleCount];
+  bleLog("[CAL SPEED] " + String(reverse ? "reverse " : "forward ") +
+         String(sampleCount + 1) + "/3; keep 5 ft clear.");
+  float along = 0.0f, seconds = 0.0f, headingDelta = 0.0f;
+  if (!measureCalibrationTravel(reverse, pulse, static_cast<int>(steerCentreUs()),
+                                3.0f, generation, along, seconds, headingDelta)) {
+    bleLog("[CAL FAIL] Speed run did not reach 3 ft in the commanded direction.");
+    return false;
+  }
+  SpeedCalibrationSample sample = {
+    pulse,
+    along / seconds,
+    fabsf(along),
+    static_cast<int8_t>(reverse ? -1 : +1),
+  };
+  if (reverse) reverseSpeedSamples[sampleCount++] = sample;
+  else forwardSpeedSamples[sampleCount++] = sample;
+  bleLog("[CAL SAMPLE] throttle=" + String(pulse) +
+         " speed=" + String(sample.speedFps, 2) + " ft/s.");
+  tryCommitMotionCalibration();
+  return true;
+}
+
+bool runReverseCalibrationStep(uint32_t generation) {
+  reverseCalibrationVerified = runDriveTest(generation);
+  if (!reverseCalibrationVerified) {
+    bleLog("[CAL FAIL] Reverse direction was not verified.");
+    return false;
+  }
+  bleLog("[CAL PASS] Reverse direction sequence verified.");
+  tryCommitMotionCalibration();
+  return true;
+}
+
+void runCalibrationCommand(uint8_t opcode) {
+  if (calibrationActive) {
+    bleLog("[CAL] A calibration step is already active.");
+    return;
+  }
+  calibrationActive = true;
+  const uint32_t generation = currentSafetyAbortGeneration();
+  bool ok = false;
+  if (opcode == 5) ok = runSteeringCalibrationStep(generation);
+  else if (opcode == 6) ok = runSpeedCalibrationStep(generation);
+  else if (opcode == 7) ok = runReverseCalibrationStep(generation);
+  setSpray(false);
+  stopDrive();
+  calibrationActive = false;
+  if (!ok) bleLog("[CAL] Step failed; correct the cause and explicitly retry.");
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
@@ -853,7 +1170,7 @@ void runSelfTest() {
 // map slightly without changing its shape.
 void steerCurvature(float curvaturePerFt) {
   if (steerSign < 0) curvaturePerFt = -curvaturePerFt;
-  float us = pulseForCurvature(STEERING_MAP, STEERING_MAP_COUNT, curvaturePerFt);
+  float us = pulseForCurvature(steeringMap, steeringMapCount, curvaturePerFt);
   if (!isfinite(us)) {
     steeringMapValid = false;
     us = STEER_CENTER_US;
@@ -869,9 +1186,9 @@ float curvatureForCommand(float rightward) {
   if (rightward < -MAX_STEER_OFFSET) rightward = -MAX_STEER_OFFSET;
   if (rightward >= 0.0f) {
     return (rightward / MAX_STEER_OFFSET) *
-           STEERING_MAP[STEERING_MAP_COUNT - 1].curvaturePerFt;
+           steeringMap[steeringMapCount - 1].curvaturePerFt;
   }
-  return (-rightward / MAX_STEER_OFFSET) * STEERING_MAP[0].curvaturePerFt;
+  return (-rightward / MAX_STEER_OFFSET) * steeringMap[0].curvaturePerFt;
 }
 
 void planRoute() {
@@ -1025,7 +1342,7 @@ void runFollow() {
     directionRequested = true;
     speedController.reset();
     speedController.feedForwardUs = reversing
-        ? DRY_FALLBACK_REV_OFFSET_US : DRY_FALLBACK_FWD_OFFSET_US;
+        ? reverseFeedForwardUs : forwardFeedForwardUs;
     const int initialPulse = NEUTRAL_US + static_cast<int>(
         reversing ? -speedController.feedForwardUs : speedController.feedForwardUs);
     driveDirection.begin(reversing, reversing, millis(), robotX_ft, robotY_ft,
@@ -1184,7 +1501,11 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         invalidPacketCount++;
         return;
       }
-      sendAck(mission.acceptCalibration(calibration, receivedAtMs));
+      protocol_v2::AckV2 ack = mission.acceptCalibration(calibration, receivedAtMs);
+      if (ack.faultCode == F_NONE && !mission.lastSetupWasDuplicate()) {
+        resetMotionCalibrationSession();
+      }
+      sendAck(ack);
       return;
     }
 
@@ -1206,6 +1527,10 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         if (routeCount < 2 || routeStyle == ROUTE_NONE) {
           enterFault(routePlanningFault);
           ack = mission.overrideLastSetupWithFault(routePlanningFault);
+        } else if (!motionCalibrationReady()) {
+          bleLog("!! Wet operation requires a stored motion calibration matching this mission ID.");
+          enterFault(F_CALIBRATION);
+          ack = mission.overrideLastSetupWithFault(F_CALIBRATION);
         }
       }
       sendAck(ack);
@@ -1219,13 +1544,25 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         return;
       }
 
-      if (command.opcode == 1 || command.opcode == 2) {
+      const bool calibrationOpcode = command.opcode >= 5 && command.opcode <= 7;
+      if (calibrationOpcode && mission.state() == S_IDLE) {
+        dryRunMode = true;  // calibration commands are explicit dry-motion confirmations
+        setSpray(false);
+      }
+      if (command.opcode == 1 || command.opcode == 2 || calibrationOpcode) {
         const bool ready = ensurePwmReady();
         mission.setPwmReady(ready);
       }
 
-      protocol_v2::AckV2 ack = mission.acceptCommand(command, receivedAtMs);
+      protocol_v2::AckV2 ack = mission.acceptCommand(
+          command, receivedAtMs, calibrationOpcode && dryRunMode);
       const bool duplicate = mission.lastCommandWasDuplicate();
+
+      if (calibrationOpcode) {
+        sendAck(ack);  // acknowledge the operator-confirmed step before it moves
+        if (ack.faultCode == F_NONE && !duplicate) runCalibrationCommand(command.opcode);
+        return;
+      }
 
       if (command.opcode == 3) {
         setSpray(false);
@@ -1374,6 +1711,9 @@ class ServerCallbacks : public BLEServerCallbacks {
     announceArea();
     bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
            String(turnRadiusRightFt, 2) + " ft.");
+    bleLog(hasStoredMotionCalibration
+        ? "[CAL] Stored motion calibration loaded."
+        : "[CAL] No valid stored motion calibration; wet operation is blocked.");
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
     if (hasBootFaultSummary) {
@@ -1398,7 +1738,9 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  steeringMapValid = validSteeringMap(STEERING_MAP, STEERING_MAP_COUNT);
+  steeringMapValid = validSteeringMap(steeringMap, steeringMapCount);
+  hasStoredMotionCalibration = calibrationPersistence.load(storedMotionCalibration);
+  if (hasStoredMotionCalibration) applyMotionCalibration(storedMotionCalibration);
 
   pinMode(VALVE_PIN, OUTPUT);
   pinMode(PUMP_PIN, OUTPUT);
@@ -1463,7 +1805,7 @@ void loop() {
       driveDirection.wrongDirection,
       true,
       routeCount >= 2 && routeStyle != ROUTE_NONE && !routeRequirements.truncated,
-      steeringMapValid,
+      motionCalibrationReady(),
       routeStyle != ROUTE_NONE,
     };
     FaultCode fault = evaluateSafety(mission.state(), safety);
