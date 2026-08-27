@@ -8,6 +8,7 @@ import {
   View,
 } from 'react-native';
 import { CalibrationRecord, PavementSurface } from './calibration';
+import { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 import { MissionLogFile } from './missionLog';
 import { Pose } from './poseMath';
 import { SetupAction, SetupState } from './setupMachine';
@@ -128,11 +129,11 @@ export default function SetupWizard(props: SetupWizardProps) {
   const [startClearText, setStartClearText] = useState('18.5');
   const [endClearText, setEndClearText] = useState('11.3');
   const [side, setSide] = useState<'right' | 'left'>('right');
-  const [cameraForward, setCameraForward] = useState('0');
-  const [cameraRight, setCameraRight] = useState('0');
-  const [cameraYaw, setCameraYaw] = useState('0');
-  const [sprayForward, setSprayForward] = useState('0');
-  const [sprayRight, setSprayRight] = useState('0');
+  const [cameraForward, setCameraForward] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraForwardFt));
+  const [cameraRight, setCameraRight] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraRightFt));
+  const [cameraYaw, setCameraYaw] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraYawDeg));
+  const [sprayForward, setSprayForward] = useState(String(DEFAULT_MOUNT_CALIBRATION.sprayForwardFt));
+  const [sprayRight, setSprayRight] = useState(String(DEFAULT_MOUNT_CALIBRATION.sprayRightFt));
   const [surface, setSurface] = useState<PavementSurface>('concrete');
 
   useEffect(() => {
