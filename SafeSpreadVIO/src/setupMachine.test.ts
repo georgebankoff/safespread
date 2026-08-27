@@ -2,6 +2,8 @@ import { crc16Ccitt, FaultSampleV2 } from './protocolV2';
 import {
   assembleFaultPackets,
   initialSetupState,
+  isAuthoritativeLogReady,
+  MissionOperationGate,
   setupReducer,
   SetupState,
 } from './setupMachine';
@@ -152,6 +154,27 @@ describe('setupReducer', () => {
     expect(state.validationError).toBeTruthy();
   });
 
+  it('requires explicit confirmation for an entered LEFT coverage side', () => {
+    let state = reduce(
+      connectedState(),
+      { type: 'SELECT_RECTANGLE_MODE', mode: 'entered' },
+      {
+        type: 'SET_ENTERED_RECTANGLE',
+        pose: atA,
+        mFt: 20,
+        nFt: 8,
+        side: 'left',
+        startClearFt: 8,
+        endClearFt: 9,
+      },
+      { type: 'CONTINUE' },
+    );
+    expect(state.phase).toBe('rectangle');
+    expect(state.validationError).toMatch(/left.*confirm/i);
+    state = reduce(state, { type: 'CONFIRM_COVERAGE_SIDE' }, { type: 'CONTINUE' });
+    expect(state.phase).toBe('calibration');
+  });
+
   it('does not advance for incompatible firmware', () => {
     const state = reduce(
       initialSetupState(),
@@ -234,6 +257,26 @@ describe('setupReducer', () => {
     expect(state.phase).toBe('rectangle');
     expect(state.connectionStatus).toBe('connected');
     expect(state.compatible).toBe(true);
+  });
+});
+
+describe('MissionOperationGate', () => {
+  it('invalidates stale async workflows when Stop begins', () => {
+    const gate = new MissionOperationGate();
+    const stale = gate.begin();
+    expect(gate.isCurrent(stale)).toBe(true);
+    gate.cancel();
+    expect(gate.isCurrent(stale)).toBe(false);
+    expect(() => gate.assertCurrent(stale)).toThrow(/cancelled/i);
+    expect(gate.isCurrent(gate.begin())).toBe(true);
+  });
+});
+
+describe('isAuthoritativeLogReady', () => {
+  it('rejects a retained logger object after its append pipeline has failed', () => {
+    expect(isAuthoritativeLogReady({ failed: false })).toBe(true);
+    expect(isAuthoritativeLogReady({ failed: true })).toBe(false);
+    expect(isAuthoritativeLogReady(null)).toBe(false);
   });
 });
 

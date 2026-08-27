@@ -34,36 +34,60 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
   private faultSampleListeners = new Set<(sample: FaultSampleV2) => void>();
   private faultPacketListeners = new Set<(packet: Uint8Array) => void>();
   private disconnectListeners = new Set<() => void>();
+  private connectionGeneration = 0;
+  private cancelConnect: (() => void) | null = null;
 
   connect(
     onStatusChange: (status: ConnectionStatus) => void,
     onLog?: (line: string) => void,
   ): Promise<void> {
+    this.cancelConnect?.();
+    const generation = ++this.connectionGeneration;
     this.logListener = onLog ?? null;
     onStatusChange('scanning');
     return new Promise((resolve, reject) => {
-      let settled = false;
+      let finished = false;
+      let found = false;
+      const isCurrent = () => generation === this.connectionGeneration;
+      const finish = (error?: unknown) => {
+        if (finished) return;
+        finished = true;
+        if (this.cancelConnect === cancel) this.cancelConnect = null;
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      const cancel = () => finish(new Error('BLE connection cancelled'));
+      this.cancelConnect = cancel;
       this.manager.startDeviceScan([NUS_SERVICE_UUID], null, async (error, scanned) => {
-        if (settled) return;
+        if (finished || found || !isCurrent()) return;
         if (error) {
-          settled = true;
           this.manager.stopDeviceScan();
           onStatusChange('disconnected');
-          reject(error);
+          finish(error);
           return;
         }
         if (scanned?.name !== DEVICE_NAME) return;
 
-        settled = true;
+        found = true;
         this.manager.stopDeviceScan();
+        let device: Device | null = null;
         try {
-          const device = await scanned.connect();
+          device = await scanned.connect();
+          if (!isCurrent() || finished) {
+            await device.cancelConnection().catch(() => {});
+            return;
+          }
           await device.discoverAllServicesAndCharacteristics();
+          if (!isCurrent() || finished) {
+            await device.cancelConnection().catch(() => {});
+            return;
+          }
           this.device = device;
           this.notificationSubscription = device.monitorCharacteristicForService(
             NUS_SERVICE_UUID,
             NUS_NOTIFY_UUID,
             (monitorError, characteristic) => {
+              if (!isCurrent() || this.device !== device) return;
               if (monitorError) {
                 this.logListener?.(`[BLE] notify error: ${monitorError.message}`);
                 return;
@@ -73,6 +97,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
             },
           );
           this.disconnectSubscription = device.onDisconnected(() => {
+            if (!isCurrent() || this.device !== device) return;
             this.device = null;
             onStatusChange('disconnected');
             for (const listener of this.disconnectListeners) listener();
@@ -80,27 +105,44 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
 
           try {
             await this.probeProtocolV2();
+            if (!isCurrent() || finished) {
+              await device.cancelConnection().catch(() => {});
+              return;
+            }
           } catch (probeError) {
+            if (!isCurrent() || finished) {
+              await device.cancelConnection().catch(() => {});
+              return;
+            }
+            this.notificationSubscription?.remove();
+            this.notificationSubscription = null;
             this.disconnectSubscription?.remove();
             this.disconnectSubscription = null;
             await device.cancelConnection().catch(() => {});
             this.device = null;
             onStatusChange('incompatible');
-            reject(probeError);
+            finish(probeError);
             return;
           }
           onStatusChange('connected');
-          resolve();
+          finish();
         } catch (connectionError) {
+          if (!isCurrent() || finished) {
+            await device?.cancelConnection().catch(() => {});
+            return;
+          }
           this.device = null;
           onStatusChange('disconnected');
-          reject(connectionError);
+          finish(connectionError);
         }
       });
     });
   }
 
   async disconnect(): Promise<void> {
+    this.connectionGeneration += 1;
+    this.cancelConnect?.();
+    this.cancelConnect = null;
     this.manager.stopDeviceScan();
     this.notificationSubscription?.remove();
     this.notificationSubscription = null;

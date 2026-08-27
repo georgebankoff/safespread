@@ -35,6 +35,12 @@ interface PendingAck {
   listeners: Set<(ack: AckV2) => void>;
 }
 
+class MissionOperationCancelled extends Error {
+  constructor() {
+    super('mission operation cancelled by Stop');
+  }
+}
+
 export class MissionControl {
   private currentState: MissionClientState = 'idle';
   private nextCommandId = 1;
@@ -47,6 +53,7 @@ export class MissionControl {
   private readonly preferForwardOnly: boolean;
   private calibrationId = 0;
   private preparedCalibration: CalibrationWire | null = null;
+  private operationGeneration = 0;
 
   constructor(
     private readonly transport: MissionTransport,
@@ -70,7 +77,7 @@ export class MissionControl {
 
   async configure(definition: RectangleDefinition, calibration: CalibrationWire): Promise<AckV2> {
     if (this.currentState !== 'idle') throw new Error('mission must be idle before configure');
-    return this.exclusive(async () => {
+    return this.exclusive(async (generation) => {
       this.calibrationId = calibration.id;
       if (!this.samePreparedCalibration(calibration)) {
         const calibrationCommandId = this.takeCommandId();
@@ -82,7 +89,7 @@ export class MissionControl {
           sprayForwardFt: calibration.sprayForwardFt,
           sprayRightFt: calibration.sprayRightFt,
           schemaVersion: calibration.schemaVersion,
-        }), calibrationCommandId);
+        }), calibrationCommandId, generation);
         this.requireAck(calibrationAck, [0, 1], calibration.id);
         this.preparedCalibration = { ...calibration };
       }
@@ -100,7 +107,7 @@ export class MissionControl {
         startClearFt: definition.startClearFt,
         endClearFt: definition.endClearFt,
         calibrationId: calibration.id,
-      }), rectangleCommandId);
+      }), rectangleCommandId, generation);
       this.requireAck(rectangleAck, [1], calibration.id);
       this.currentState = 'configured';
       return rectangleAck;
@@ -109,7 +116,7 @@ export class MissionControl {
 
   async prepareCalibration(calibration: CalibrationWire): Promise<AckV2> {
     if (this.currentState !== 'idle') throw new Error('mission must be idle before calibration setup');
-    return this.exclusive(async () => {
+    return this.exclusive(async (generation) => {
       this.calibrationId = calibration.id;
       const commandId = this.takeCommandId();
       const acknowledgement = await this.sendAndWait(buildCalibrationV2({
@@ -120,7 +127,7 @@ export class MissionControl {
         sprayForwardFt: calibration.sprayForwardFt,
         sprayRightFt: calibration.sprayRightFt,
         schemaVersion: calibration.schemaVersion,
-      }), commandId);
+      }), commandId, generation);
       this.requireAck(acknowledgement, [0], calibration.id);
       this.preparedCalibration = { ...calibration };
       return acknowledgement;
@@ -162,6 +169,7 @@ export class MissionControl {
   }
 
   async stop(): Promise<AckV2> {
+    if (this.busy) return this.priorityStop();
     let acknowledgement: AckV2 | null = null;
     try {
       acknowledgement = await this.command(3, [0], 'idle', false);
@@ -191,26 +199,61 @@ export class MissionControl {
     nextState: MissionClientState,
     validateCalibration = true,
   ): Promise<AckV2> {
-    return this.exclusive(async () => {
+    return this.exclusive(async (generation) => {
       const commandId = this.takeCommandId();
-      const ack = await this.sendAndWait(buildCommandV2({ opcode, epoch: this.epoch, commandId }), commandId);
+      const ack = await this.sendAndWait(
+        buildCommandV2({ opcode, epoch: this.epoch, commandId }),
+        commandId,
+        generation,
+      );
       this.requireAck(ack, expectedStates, validateCalibration ? this.calibrationId : null);
       this.currentState = nextState;
       return ack;
     });
   }
 
-  private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
+  private async exclusive<T>(operation: (generation: number) => Promise<T>): Promise<T> {
     if (this.busy) throw new Error('another mission command is pending');
     this.busy = true;
+    const generation = this.operationGeneration;
     try {
-      return await operation();
+      const result = await operation(generation);
+      this.ensureCurrent(generation);
+      return result;
     } catch (error) {
-      this.currentState = 'fault';
+      if (!(error instanceof MissionOperationCancelled)) this.currentState = 'fault';
       throw error;
     } finally {
       this.busy = false;
     }
+  }
+
+  private async priorityStop(): Promise<AckV2> {
+    this.operationGeneration += 1;
+    const commandId = this.takeCommandId();
+    this.currentState = 'idle';
+    this.preparedCalibration = null;
+    this.calibrationId = 0;
+    try {
+      await this.transport.writeWithResponse(buildCommandV2({
+        opcode: 3,
+        epoch: this.epoch,
+        commandId,
+      }));
+    } finally {
+      await this.transport.writeCompatibilityStop();
+    }
+    return {
+      state: 0,
+      epoch: this.epoch,
+      commandId,
+      faultCode: 0,
+      calibrationId: 0,
+    };
+  }
+
+  private ensureCurrent(generation: number): void {
+    if (generation !== this.operationGeneration) throw new MissionOperationCancelled();
   }
 
   private takeCommandId(): number {
@@ -236,12 +279,19 @@ export class MissionControl {
     this.pending.listeners.clear();
   }
 
-  private async sendAndWait(packet: Uint8Array, commandId: number): Promise<AckV2> {
+  private async sendAndWait(
+    packet: Uint8Array,
+    commandId: number,
+    generation: number,
+  ): Promise<AckV2> {
+    this.ensureCurrent(generation);
     this.pending = { commandId, received: null, listeners: new Set() };
     try {
       for (let attempt = 0; attempt <= this.retries; attempt += 1) {
         await this.transport.writeWithResponse(packet);
+        this.ensureCurrent(generation);
         const ack = await this.waitForAck();
+        this.ensureCurrent(generation);
         if (ack) return ack;
       }
       throw new Error(`ACK timeout for command ${commandId}`);

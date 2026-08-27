@@ -39,11 +39,11 @@ class FakeTransport implements MissionTransport {
   writes: Uint8Array[] = [];
   compatibilityStops = 0;
   listener: ((packet: Uint8Array) => void) | null = null;
-  onWrite?: (packet: Uint8Array, writeNumber: number) => void;
+  onWrite?: (packet: Uint8Array, writeNumber: number) => void | Promise<void>;
 
   async writeWithResponse(packet: Uint8Array) {
     this.writes.push(packet.slice());
-    this.onWrite?.(packet, this.writes.length);
+    await this.onWrite?.(packet, this.writes.length);
   }
   async writeCompatibilityStop() { this.compatibilityStops += 1; }
   subscribeAck(listener: (packet: Uint8Array) => void) {
@@ -232,5 +232,28 @@ describe('MissionControl emergency stop', () => {
     autoAckConfiguration(transport);
     await control.configure(rectangle, calibration);
     expect(transport.writes.slice(-2).map((packet) => packet[1])).toEqual([0x4b, 0x44]);
+  });
+
+  it('priority Stop cancels a pending Configure before it can send Rectangle or Arm', async () => {
+    const transport = new FakeTransport();
+    let releaseCalibration!: () => void;
+    const calibrationBlocked = new Promise<void>((resolve) => { releaseCalibration = resolve; });
+    transport.onWrite = async (packet, writeNumber) => {
+      if (writeNumber === 1) {
+        await calibrationBlocked;
+        transport.emit(ack(7, packetId(packet), 0));
+      }
+    };
+    const control = new MissionControl(transport, 7, () => true, { timeoutMs: 20, retries: 0 });
+    const configuring = control.configure(rectangle, calibration);
+    await Promise.resolve();
+    await control.stop();
+    releaseCalibration();
+    await expect(configuring).rejects.toThrow(/cancelled/i);
+    expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
+      [0x4b, 0],
+      [0x43, 3],
+    ]);
+    expect(control.state).toBe('idle');
   });
 });

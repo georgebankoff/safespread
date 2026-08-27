@@ -42,9 +42,8 @@ export default function RunningMission(props: RunningMissionProps) {
         </View>
         <Pressable
           accessibilityRole="button"
-          disabled={props.busy}
           onPress={() => void props.onStop()}
-          style={({ pressed }) => [styles.stop, props.busy && styles.disabled, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.stop, pressed && styles.pressed]}
         >
           <Text style={styles.stopText}>STOP</Text>
         </Pressable>
