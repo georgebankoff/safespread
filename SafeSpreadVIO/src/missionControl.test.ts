@@ -126,6 +126,74 @@ describe('MissionControl ordering and acknowledgements', () => {
     const control = new MissionControl(transport, 7, () => true, { timeoutMs: 5, retries: 0 });
     await expect(control.configure(rectangle, calibration)).rejects.toThrow('calibration');
   });
+
+  it('prepares and runs dry calibration while idle, then reuses that setup for configure', async () => {
+    const transport = new FakeTransport();
+    transport.onWrite = (packet) => {
+      const state = packet[1] === 0x44 ? 1 : 0;
+      transport.emit(ack(7, packetId(packet), state));
+    };
+    const control = new MissionControl(transport, 7, () => true, {
+      timeoutMs: 5,
+      retries: 0,
+      dryMode: true,
+    });
+    await control.prepareCalibration(calibration);
+    await control.runCalibrationStep(5);
+    await control.configure(rectangle, calibration);
+
+    expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
+      [0x4b, 0],
+      [0x43, 5],
+      [0x44, 6],
+    ]);
+    expect(control.state).toBe('configured');
+  });
+
+  it('requires dry mode, a prepared calibration, and a fresh pose for calibration motion', async () => {
+    const wetTransport = new FakeTransport();
+    const wet = new MissionControl(wetTransport, 7, () => true, {
+      timeoutMs: 5,
+      retries: 0,
+      dryMode: false,
+    });
+    await expect(wet.runCalibrationStep(5)).rejects.toThrow(/dry/i);
+
+    const transport = new FakeTransport();
+    const control = new MissionControl(transport, 7, () => false, {
+      timeoutMs: 5,
+      retries: 0,
+      dryMode: true,
+    });
+    await expect(control.runCalibrationStep(6)).rejects.toThrow(/prepared/i);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
+    await control.prepareCalibration(calibration);
+    await expect(control.runCalibrationStep(6)).rejects.toThrow(/fresh/i);
+  });
+
+  it('requests the frozen fault dump while idle without requiring calibration identity', async () => {
+    const transport = new FakeTransport();
+    const control = new MissionControl(transport, 7, () => false, { timeoutMs: 5, retries: 0 });
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0, 0));
+    await control.dumpFault();
+    expect(transport.writes).toHaveLength(1);
+    expect(transport.writes[0][1]).toBe(0x43);
+    expect(transport.writes[0][3]).toBe(8);
+    expect(control.state).toBe('idle');
+  });
+
+  it('runs the retained stationary self-test only after the v2 epoch is prepared', async () => {
+    const transport = new FakeTransport();
+    const control = new MissionControl(transport, 7, () => true, { timeoutMs: 5, retries: 0 });
+    await expect(control.selfTest()).rejects.toThrow(/prepared/i);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
+    await control.prepareCalibration(calibration);
+    await control.selfTest();
+    expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
+      [0x4b, 0],
+      [0x43, 4],
+    ]);
+  });
 });
 
 describe('MissionControl emergency stop', () => {
@@ -155,4 +223,14 @@ describe('MissionControl emergency stop', () => {
       expect(stopPacket[3]).toBe(3);
     },
   );
+
+  it('forgets prepared firmware setup after Stop so a later configure resends calibration', async () => {
+    const transport = new FakeTransport();
+    const control = await configuredControl(transport);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
+    await control.stop();
+    autoAckConfiguration(transport);
+    await control.configure(rectangle, calibration);
+    expect(transport.writes.slice(-2).map((packet) => packet[1])).toEqual([0x4b, 0x44]);
+  });
 });
