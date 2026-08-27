@@ -22,6 +22,7 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <math.h>
+#include "direction.h"
 #include "fault_buffer.h"
 #include "headland.h"
 #include "mission_protocol.h"
@@ -29,7 +30,9 @@
 #include "protocol_v2.h"
 #include "route.h"
 #include "safety.h"
+#include "speed_control.h"
 #include "steering.h"
+#include "steering_map.h"
 
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -44,14 +47,11 @@ const int PUMP_PIN  = 6;
 
 const int NEUTRAL_US = 1500;
 
-// Fixed throttle pulses. These are the values from before the speed loop; they
-// were set against an empty rover, so a full tank may not move at all. Raise
-// THROTTLE_FWD_US (and the others with it) if it will not pull the weight --
-// 1620 is only 120us above neutral, barely clear of the ESC deadband, and
-// there is room up to about 1900.
-const int THROTTLE_FWD_US  = 1620;
-const int THROTTLE_TURN_US = 1600;
-const int THROTTLE_REV_US  = 1380;
+// Safe dry-calibration starting points only. Navigation closes the loop on
+// measured speed; Task 11 replaces these feed-forward magnitudes with the
+// accepted pavement calibration before wet operation can arm.
+const float DRY_FALLBACK_FWD_OFFSET_US = 120.0f;
+const float DRY_FALLBACK_REV_OFFSET_US = 120.0f;
 
 const int STEER_CENTER_US = 1500;
 const int STEER_LEFT_US   = 2390;
@@ -84,25 +84,21 @@ float turnRadiusRightFt = 2.92f;
 // which shows up as pairs of overlapping lines with gaps between them, not as
 // obvious drift.
 //
-// The measured circles say where the true centre is. Steering angle grows
-// roughly with distance from it, and turning radius goes as the reciprocal of
-// the angle, so
-//     (LEFT_US - c) / (c - RIGHT_US) = rRight / rLeft
-// With 4.33 ft left and 2.92 ft right that puts c near 1709us, not 1500: the
-// wheels have been sitting about a fifth of full lock to the right whenever
-// the code believed they were straight.
-// The arithmetic lives in steering.h so it can be tested on a host against a
-// simulated rover whose real centre is known.
-float steerTrimUs = 0.0f;               // learned on top of the computed centre
-const float STEER_TRIM_LIMIT_US = 250.0f;
-const float STEER_TRIM_RATE     = 0.05f;
-const float STEER_TRIM_NEAR_FT  = 0.4f; // only learn while actually on the line
+// Explicit measured curvature map. Straight is a direct calibration knot,
+// not a midpoint inferred from the two steering endpoints. Runtime control
+// interpolates this table without silently relearning its center.
+const SteeringKnot STEERING_MAP[] = {
+  {STEER_LEFT_US, -1.0f / 4.33f},
+  {1709, 0.0f},
+  {STEER_RIGHT_US, 1.0f / 2.92f},
+};
+const int STEERING_MAP_COUNT = sizeof(STEERING_MAP) / sizeof(STEERING_MAP[0]);
+bool steeringMapValid = false;
 int  lastSteerCommandUs = 1500;
-unsigned long lastTrimUpdate = 0;
 
 float steerCentreUs() {
-  return steeringCentreUs(turnRadiusLeftFt, turnRadiusRightFt,
-                          STEER_LEFT_US, STEER_RIGHT_US) + steerTrimUs;
+  const float pulse = pulseForCurvature(STEERING_MAP, STEERING_MAP_COUNT, 0.0f);
+  return isfinite(pulse) ? pulse : static_cast<float>(STEER_CENTER_US);
 }
 
 // Steering polarity: +1 means a pulse BELOW centre steers toward increasing
@@ -206,11 +202,11 @@ const float LINE_DISTANCE_CONST_FT = 1.5f;
 const int   ROUTE_SEARCH_WINDOW = 80;
 const float CUSP_TOL_FT       = 0.5f;
 
-// An RC ESC will not change direction until it has seen neutral, so a
-// three-point turn has to pause briefly at each cusp.
-const unsigned long DIR_CHANGE_PAUSE_MS = 350;
 bool escReverse = false;
-unsigned long dirChangeAt = 0;
+bool directionRequested = false;
+DirectionState driveDirection;
+SpeedPI speedController;
+unsigned long lastSpeedControlMs = 0;
 
 // If the rover cannot make measured progress toward its target, fault rather
 // than silently skipping untreated pavement.
@@ -416,6 +412,10 @@ void setSpray(bool on) {
 }
 
 void stopDrive() {
+  driveDirection.stop();
+  speedController.reset();
+  directionRequested = false;
+  lastSpeedControlMs = 0;
   setChannelPulse(ESC_CH, NEUTRAL_US);
   setChannelPulse(STEER_CH, (int)steerCentreUs());
 }
@@ -644,9 +644,8 @@ void pumpBle() {
   consumePendingPose();
 }
 
-/** Drive briefly at the given pulse and report how far the rover moved along
- *  its own nose: positive is forwards, negative is backwards. Returns false if
- *  it did not really move. */
+/** Prove a direction through the same neutral/brake/command/verify state used
+ *  by navigation. Report displacement along the rover's initial nose. */
 bool diagnosticCanContinue(uint32_t generation) {
   bool pending;
   uint32_t currentGeneration;
@@ -668,27 +667,35 @@ bool diagnosticWait(unsigned long durationMs, uint32_t generation) {
   return diagnosticCanContinue(generation);
 }
 
-bool measureDrive(int pulseUs, uint32_t generation, float &alongFt) {
+bool measureDrive(bool reverse, uint32_t generation, float &alongFt) {
   if (!diagnosticCanContinue(generation)) return false;
   float h = robotHeading * (float)M_PI / 180.0f;
   setChannelPulse(STEER_CH, (int)steerCentreUs());
-
-  // An RC ESC needs to see neutral before it will accept the other direction.
-  setChannelPulse(ESC_CH, NEUTRAL_US);
-  if (!diagnosticWait(800, generation)) return false;
-
   float x0 = robotX_ft, y0 = robotY_ft;
-  setChannelPulse(ESC_CH, pulseUs);
-  if (!diagnosticWait(2000, generation)) {
-    stopDrive();
-    return false;
+
+  const int pulseUs = NEUTRAL_US + static_cast<int>(
+      reverse ? -DRY_FALLBACK_REV_OFFSET_US : DRY_FALLBACK_FWD_OFFSET_US);
+  driveDirection.begin(reverse, reverse, millis(), robotX_ft, robotY_ft,
+                       robotHeading, pulseUs, NEUTRAL_US);
+  while (!driveDirection.ready() && !driveDirection.failed()) {
+    pumpBle();
+    if (!diagnosticCanContinue(generation)) {
+      stopDrive();
+      return false;
+    }
+    setChannelPulse(ESC_CH,
+                    driveDirection.update(millis(), robotX_ft, robotY_ft));
+    delay(10);
   }
+
   setChannelPulse(ESC_CH, NEUTRAL_US);
   if (!diagnosticWait(500, generation)) return false;
 
   float dx = robotX_ft - x0, dy = robotY_ft - y0;
   alongFt = dx * sinf(h) + dy * cosf(h);
-  return fabsf(alongFt) > 0.25f;
+  const bool verified = driveDirection.ready();
+  driveDirection.stop();
+  return verified;
 }
 
 // Whether the rover can actually back up is the one assumption the whole route
@@ -703,19 +710,21 @@ bool runDriveTest(uint32_t generation) {
   }
 
   float fwd = 0.0f, rev = 0.0f;
-  bool movedFwd = measureDrive(THROTTLE_FWD_US, generation, fwd);
+  bool movedFwd = measureDrive(false, generation, fwd);
+  bool forwardVerified = movedFwd && fwd > 0.0f;
   if (!diagnosticCanContinue(generation)) return false;
   bleLog("Forward: moved " + String(fwd, 2) + " ft along its nose.");
   if (!movedFwd) {
-    bleLog("[FAIL] Did not move forward. Raise THROTTLE_FWD_US, or the");
-    bleLog("       drive battery / ESC is not delivering power.");
+    bleLog("[FAIL] Did not verify forward motion before the timeout.");
+    bleLog("       Check drive battery/ESC or recalibrate feed-forward.");
   } else if (fwd < 0.0f) {
     bleLog("[FAIL] Moved BACKWARDS on a forward command -- ESC is reversed.");
   } else {
     bleLog("[PASS] Forward works.");
   }
 
-  bool movedRev = measureDrive(THROTTLE_REV_US, generation, rev);
+  bool movedRev = measureDrive(true, generation, rev);
+  bool reverseVerified = movedRev && rev < 0.0f;
   if (!diagnosticCanContinue(generation)) return false;
   bleLog("Reverse: moved " + String(rev, 2) + " ft along its nose.");
   if (!movedRev) {
@@ -731,7 +740,7 @@ bool runDriveTest(uint32_t generation) {
 
   stopDrive();
   bleLog("--- DRIVE TEST COMPLETE ---");
-  return true;
+  return forwardVerified && reverseVerified;
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
@@ -829,7 +838,7 @@ void runSelfTest() {
   bleLog("[INFO] Valve OFF.");
 
   if (!runDriveTest(generation)) {
-    bleLog("=== SELF TEST STOPPED ===");
+    bleLog("=== SELF TEST FAILED: MOTION NOT VERIFIED ===");
     setSpray(false); stopDrive(); selfTestActive = false; return;
   }
 
@@ -839,34 +848,30 @@ void runSelfTest() {
   selfTestActive = false;
 }
 
-// `rightward` > 0 steers toward increasing heading (rover's right), with
-// MAX_STEER_OFFSET meaning full lock. Each side is scaled by its own travel
-// from the true centre, which is not the same on both sides, so an equal
-// command gives an equal fraction of the available turn whichever way it goes.
-void steerRightward(float rightward) {
-  if (steerSign < 0) rightward = -rightward;
-
-  float us = steerPulseUs(rightward, steerCentreUs(),
-                          STEER_LEFT_US, STEER_RIGHT_US, MAX_STEER_OFFSET);
-
-  lastSteerCommandUs = (int)us;
-  setChannelPulse(STEER_CH, (int)us);
+// Curvature is positive toward increasing heading (the rover's right). Pulse
+// output comes only from the validated measured map; trim shifts the complete
+// map slightly without changing its shape.
+void steerCurvature(float curvaturePerFt) {
+  if (steerSign < 0) curvaturePerFt = -curvaturePerFt;
+  float us = pulseForCurvature(STEERING_MAP, STEERING_MAP_COUNT, curvaturePerFt);
+  if (!isfinite(us)) {
+    steeringMapValid = false;
+    us = STEER_CENTER_US;
+  }
+  if (us < STEER_RIGHT_US) us = STEER_RIGHT_US;
+  if (us > STEER_LEFT_US) us = STEER_LEFT_US;
+  lastSteerCommandUs = static_cast<int>(lroundf(us));
+  setChannelPulse(STEER_CH, lastSteerCommandUs);
 }
 
-// On a straight pass the steering has to average out to whatever pulse really
-// does point the wheels straight -- so the average of what we apply IS the
-// true centre, and we can just learn it. This catches whatever the measured
-// radii did not: a servo that has crept, tyre pull, a cambered lawn. Only
-// learn while the rover is already close to its line, or the correction it is
-// making to get back on would be mistaken for the bias.
-void learnSteeringTrim(float offPlanFt) {
-  if (offPlanFt > STEER_TRIM_NEAR_FT) return;
-  if (millis() - lastTrimUpdate < 50) return;
-  lastTrimUpdate = millis();
-
-  steerTrimUs = updateSteeringTrim(steerTrimUs, (float)lastSteerCommandUs,
-                                   steerCentreUs(), STEER_TRIM_RATE,
-                                   STEER_TRIM_LIMIT_US);
+float curvatureForCommand(float rightward) {
+  if (rightward > MAX_STEER_OFFSET) rightward = MAX_STEER_OFFSET;
+  if (rightward < -MAX_STEER_OFFSET) rightward = -MAX_STEER_OFFSET;
+  if (rightward >= 0.0f) {
+    return (rightward / MAX_STEER_OFFSET) *
+           STEERING_MAP[STEERING_MAP_COUNT - 1].curvaturePerFt;
+  }
+  return (-rightward / MAX_STEER_OFFSET) * STEERING_MAP[0].curvaturePerFt;
 }
 
 void planRoute() {
@@ -890,7 +895,10 @@ void planRoute() {
   offPlanFt = 0.0f;
   worstOffThisPass = 0.0f;
   escReverse = false;
-  dirChangeAt = millis();
+  directionRequested = false;
+  driveDirection.stop();
+  speedController.reset();
+  lastSpeedControlMs = 0;
 
   // Where the first pass ends, so it can be given more latitude before spray
   // is cut. It is the pass everything else is lined up against.
@@ -1012,9 +1020,17 @@ void runFollow() {
   }
 
   bool reversing = route[routeIndex].reverse;
-  if (reversing != escReverse) {
+  if (!directionRequested || reversing != escReverse) {
     escReverse = reversing;
-    dirChangeAt = millis();
+    directionRequested = true;
+    speedController.reset();
+    speedController.feedForwardUs = reversing
+        ? DRY_FALLBACK_REV_OFFSET_US : DRY_FALLBACK_FWD_OFFSET_US;
+    const int initialPulse = NEUTRAL_US + static_cast<int>(
+        reversing ? -speedController.feedForwardUs : speedController.feedForwardUs);
+    driveDirection.begin(reversing, reversing, millis(), robotX_ft, robotY_ft,
+                         robotHeading, initialPulse, NEUTRAL_US);
+    lastSpeedControlMs = millis();
   }
 
   {
@@ -1042,7 +1058,7 @@ void runFollow() {
     reference = courseValid ? courseDeg : robotHeading;
   }
 
-  float err, command;
+  float err, command, requestedCurvature;
 
   if (route[routeIndex].turning) {
     // Through a turn there is no line to hold, only a curve to follow, so aim
@@ -1053,6 +1069,7 @@ void runFollow() {
                                       route[la].y - robotY_ft);
     err = angleDiffDeg(want, reference);
     command = err * PURSUIT_GAIN;
+    requestedCurvature = curvatureForCommand(command);
     lastCrossTrackFt = offPlanFt;
   } else {
     // On a straight run -- which is every sprayed pass -- steer onto the line
@@ -1070,6 +1087,7 @@ void runFollow() {
     float kappa = lineFollowCurvature(cross, err, LINE_DISTANCE_CONST_FT);
     command = curvatureToCommand(kappa, turnRadiusLeftFt, turnRadiusRightFt,
                                  MAX_STEER_OFFSET);
+    requestedCurvature = kappa;
   }
   lastHeadingErrorDeg = err;
 
@@ -1082,29 +1100,43 @@ void runFollow() {
   // Steering acts on the direction of travel the opposite way in reverse:
   // right lock swings the nose left, so the same command turns the rover's
   // path the other way.
-  steerRightward(reversing ? -command : command);
+  steerCurvature(reversing ? -requestedCurvature : requestedCurvature);
 
   if (!reversing) {
     observeSteeringPolarity();
     polarityLastCommand = command;
 
-    // Learn the true steering centre on the straight passes, where "straight
-    // ahead" is a fact we can check against rather than a guess.
-    if (!route[routeIndex].turning) {
-      float ox = route[routeIndex].x - robotX_ft;
-      float oy = route[routeIndex].y - robotY_ft;
-      learnSteeringTrim(sqrtf(ox * ox + oy * oy));
-    }
   } else {
     polarityLastHeading = robotHeading;   // don't let a reverse leg pollute it
   }
 
-  if (millis() - dirChangeAt < DIR_CHANGE_PAUSE_MS) {
-    setChannelPulse(ESC_CH, NEUTRAL_US);   // let the ESC re-arm
-  } else if (reversing) {
-    setChannelPulse(ESC_CH, THROTTLE_REV_US);
-  } else {
-    setChannelPulse(ESC_CH, fabsf(err) > 45.0f ? THROTTLE_TURN_US : THROTTLE_FWD_US);
+  const unsigned long speedNow = millis();
+  float speedDt = lastSpeedControlMs == 0
+      ? 0.02f : (speedNow - lastSpeedControlMs) / 1000.0f;
+  lastSpeedControlMs = speedNow;
+  if (driveDirection.phase == D_COMMAND ||
+      driveDirection.phase == D_VERIFY ||
+      driveDirection.phase == D_READY) {
+    const float targetMagnitude = route[routeIndex].turning
+        ? DEFAULT_TURN_SPEED_FPS : DEFAULT_STRAIGHT_SPEED_FPS;
+    const float targetSpeed = reversing ? -targetMagnitude : targetMagnitude;
+    const float measuredSpeed = reversing
+        ? -fabsf(lastPoseSpeedFps) : fabsf(lastPoseSpeedFps);
+    const int offsetUs = speedController.update(targetSpeed, measuredSpeed, speedDt);
+    driveDirection.commandPulseUs = NEUTRAL_US + offsetUs;
+  }
+  setChannelPulse(ESC_CH,
+                  driveDirection.update(speedNow, robotX_ft, robotY_ft));
+
+  if (driveDirection.wrongDirection) {
+    bleLog("!! Measured motion sign disagrees with the ESC direction command.");
+    enterFault(F_WRONG_DIRECTION);
+    return;
+  }
+  if (driveDirection.noDisplacement || speedController.stalled) {
+    bleLog("!! Throttle command produced no measured pavement motion.");
+    enterFault(F_STALL);
+    return;
   }
 
   if (!controlAuthorized()) {
@@ -1112,7 +1144,11 @@ void runFollow() {
     stopDrive();
     return;
   }
-  updateSpray();
+  if (driveDirection.ready()) {
+    updateSpray();
+  } else {
+    setSpray(false);
+  }
 }
 
 static uint8_t acc[64];
@@ -1362,6 +1398,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  steeringMapValid = validSteeringMap(STEERING_MAP, STEERING_MAP_COUNT);
+
   pinMode(VALVE_PIN, OUTPUT);
   pinMode(PUMP_PIN, OUTPUT);
   setSpray(false);
@@ -1421,11 +1459,11 @@ void loop() {
       false,
       pwmHealthy,
       pwmHealthy,
-      false,
-      false,
+      driveDirection.noDisplacement || speedController.stalled,
+      driveDirection.wrongDirection,
       true,
       routeCount >= 2 && routeStyle != ROUTE_NONE && !routeRequirements.truncated,
-      true,
+      steeringMapValid,
       routeStyle != ROUTE_NONE,
     };
     FaultCode fault = evaluateSafety(mission.state(), safety);
