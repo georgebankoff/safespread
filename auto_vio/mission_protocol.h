@@ -153,7 +153,8 @@ class MissionProtocol {
   }
 
   protocol_v2::AckV2 acceptCommand(
-      const protocol_v2::CommandV2 &message, uint32_t nowMs) {
+      const protocol_v2::CommandV2 &message, uint32_t nowMs,
+      bool calibrationAllowed = false) {
     lastCommandWasDuplicate_ = false;
     for (uint8_t index = 0; index < commandCacheCount_; ++index) {
       const CommandCacheEntry &entry = commandCache_[index];
@@ -214,7 +215,15 @@ class MissionProtocol {
           ? ack(message.epoch, message.commandId, F_NONE)
           : ack(message.epoch, message.commandId, F_ROUTE);
     } else if (message.opcode >= 5 && message.opcode <= 7) {
-      result = ack(message.epoch, message.commandId, F_CALIBRATION);
+      if (state_ != S_IDLE || !hasCalibration_ || !calibrationAllowed) {
+        result = ack(message.epoch, message.commandId, F_CALIBRATION);
+      } else if (!poseFresh(nowMs)) {
+        result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);
+      } else if (!pwmReady_) {
+        result = ack(message.epoch, message.commandId, F_PWM);
+      } else {
+        result = ack(message.epoch, message.commandId, F_NONE);
+      }
     } else {
       result = ack(message.epoch, message.commandId, F_ROUTE);
     }

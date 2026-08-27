@@ -27,6 +27,20 @@ static void configure(MissionProtocol &protocol, uint32_t now = 1000, bool pwmRe
 }
 
 int main() {
+  MissionProtocol calibrationGate;
+  calibrationGate.setPwmReady(true);
+  assert(calibrationGate.acceptCalibration(calibration(), 900).faultCode == F_NONE);
+  assert(calibrationGate.acceptPose(pose(1, 10), 900));
+  assert(calibrationGate.acceptCommand({5, 7, 2}, 900).faultCode == F_CALIBRATION);
+
+  MissionProtocol dryCalibration;
+  dryCalibration.setPwmReady(true);
+  assert(dryCalibration.acceptCalibration(calibration(), 900).faultCode == F_NONE);
+  assert(dryCalibration.acceptPose(pose(1, 10), 900));
+  AckV2 calibrationAck = dryCalibration.acceptCommand({5, 7, 2}, 900, true);
+  assert(calibrationAck.state == S_IDLE && calibrationAck.faultCode == F_NONE);
+  assert(dryCalibration.acceptCommand({6, 7, 3}, 1200, true).faultCode == F_POSE_TIMEOUT);
+
   MissionProtocol hardwareGate;
   configure(hardwareGate, 1000, false);
   assert(hardwareGate.acceptPose(pose(1, 10), 1000));
