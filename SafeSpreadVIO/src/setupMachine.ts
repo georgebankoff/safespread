@@ -83,6 +83,31 @@ export type SetupAction =
   | { type: 'ACK_TIMEOUT'; operation: string }
   | { type: 'STOP' };
 
+export class MissionOperationGate {
+  private generation = 0;
+
+  begin(): number {
+    this.generation += 1;
+    return this.generation;
+  }
+
+  cancel(): void {
+    this.generation += 1;
+  }
+
+  isCurrent(generation: number): boolean {
+    return generation === this.generation;
+  }
+
+  assertCurrent(generation: number): void {
+    if (!this.isCurrent(generation)) throw new Error('mission operation was cancelled by Stop');
+  }
+}
+
+export function isAuthoritativeLogReady(logger: { failed: boolean } | null): boolean {
+  return Boolean(logger && !logger.failed);
+}
+
 const NOT_READY: SetupReadiness = {
   trackingNormal: false,
   poseStable: false,
@@ -180,7 +205,7 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
             action.startClearFt,
             action.endClearFt,
           ),
-          coverageSideConfirmed: true,
+          coverageSideConfirmed: action.side === 'right',
           validationError: null,
         };
       } catch (error) {

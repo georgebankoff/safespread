@@ -22,7 +22,13 @@ import { buildPoseV2, FaultSampleV2, TelemetryV2 } from './src/protocolV2';
 import { worldToRectangle } from './src/rectangle';
 import RunningMission from './src/RunningMission';
 import SetupWizard, { CalibrationFormValue } from './src/SetupWizard';
-import { assembleFaultPackets, initialSetupState, setupReducer } from './src/setupMachine';
+import {
+  assembleFaultPackets,
+  initialSetupState,
+  isAuthoritativeLogReady,
+  MissionOperationGate,
+  setupReducer,
+} from './src/setupMachine';
 import { DEFAULT_MOUNT_CALIBRATION, useVIOPose } from './src/useVIOPose';
 
 const HARDWARE_TAG = 'safespread-rover-a';
@@ -94,6 +100,8 @@ export default function App() {
     reject(error: Error): void;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
+  const operationGateRef = useRef(new MissionOperationGate());
+  const activeOperationSettledRef = useRef<Promise<void> | null>(null);
   const selfTestWaiterRef = useRef<{
     resolve(message: string): void;
     reject(error: Error): void;
@@ -106,6 +114,40 @@ export default function App() {
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function beginMissionOperation() {
+    const generation = operationGateRef.current.begin();
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    activeOperationSettledRef.current = settled;
+    return { generation, settle };
+  }
+
+  function finishMissionOperation(generation: number, settle: () => void) {
+    settle();
+    if (operationGateRef.current.isCurrent(generation)) {
+      activeOperationSettledRef.current = null;
+      setBusy(false);
+    }
+  }
+
+  function cancelActiveMissionOperation(): Promise<void> | null {
+    const pending = activeOperationSettledRef.current;
+    operationGateRef.current.cancel();
+    const calibrationWaiter = calibrationWaiterRef.current;
+    if (calibrationWaiter) {
+      clearTimeout(calibrationWaiter.timer);
+      calibrationWaiterRef.current = null;
+      calibrationWaiter.resolve('Calibration cancelled by Stop');
+    }
+    const selfTestWaiter = selfTestWaiterRef.current;
+    if (selfTestWaiter) {
+      clearTimeout(selfTestWaiter.timer);
+      selfTestWaiterRef.current = null;
+      selfTestWaiter.resolve('Self-test cancelled by Stop');
+    }
+    return pending;
   }
 
   function recordLog(record: MissionRecord) {
@@ -150,7 +192,8 @@ export default function App() {
   async function ensureMissionResources() {
     if (!setup.rectangle) throw new Error('Define the rectangle before starting a mission.');
     if (controlRef.current && senderRef.current && epochRef.current !== null &&
-        resourceWetRef.current === setup.wet) {
+        resourceWetRef.current === setup.wet &&
+        (!setup.wet || isAuthoritativeLogReady(loggerRef.current))) {
       return { control: controlRef.current, epoch: epochRef.current };
     }
     if (controlRef.current || senderRef.current || loggerRef.current) {
@@ -228,6 +271,7 @@ export default function App() {
   async function handleMissionFault(cause: string) {
     if (faultHandledRef.current) return;
     faultHandledRef.current = true;
+    const pendingOperation = cancelActiveMissionOperation();
     dispatch({ type: 'MISSION_FAULT', cause });
     setBusy(true);
     recordLog({ type: 'fault', phoneMs: Date.now(), fault: cause, state: 'FAULT' });
@@ -239,6 +283,8 @@ export default function App() {
     } catch (error) {
       setOperationError(`Stop acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    await pendingOperation;
+    activeOperationSettledRef.current = null;
     if (control && epoch !== null) {
       faultPacketsRef.current = [];
       try {
@@ -519,25 +565,31 @@ export default function App() {
   }
 
   async function onRunCalibration(opcode: 5 | 6 | 7) {
+    const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before any calibration movement.');
       if (!calibration) throw new Error('Save mount and pavement calibration before motion calibration.');
       const { control } = await ensureMissionResources();
+      operationGateRef.current.assertCurrent(operation.generation);
       if (!calibrationPreparedRef.current) {
         await control.prepareCalibration(calibration);
+        operationGateRef.current.assertCurrent(operation.generation);
         calibrationPreparedRef.current = true;
       }
       const beforeSequence = lastPoseOfferedSequenceRef.current;
       const deadline = Date.now() + 750;
       while (lastPoseOfferedSequenceRef.current <= beforeSequence && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
+        operationGateRef.current.assertCurrent(operation.generation);
       }
       const result = awaitCalibrationResult();
       try {
         await control.runCalibrationStep(opcode);
+        operationGateRef.current.assertCurrent(operation.generation);
         setCalibrationProgress(await result);
+        operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
         const waiter = calibrationWaiterRef.current;
         if (waiter) {
@@ -547,21 +599,26 @@ export default function App() {
         throw error;
       }
     } catch (error) {
-      setOperationError(error instanceof Error ? error.message : String(error));
+      if (operationGateRef.current.isCurrent(operation.generation)) {
+        setOperationError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setBusy(false);
+      finishMissionOperation(operation.generation, operation.settle);
     }
   }
 
   async function onSelfTest() {
+    const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before the self-test.');
       if (!calibration) throw new Error('Save mount and pavement calibration before the self-test.');
       const { control } = await ensureMissionResources();
+      operationGateRef.current.assertCurrent(operation.generation);
       if (!calibrationPreparedRef.current) {
         await control.prepareCalibration(calibration);
+        operationGateRef.current.assertCurrent(operation.generation);
         calibrationPreparedRef.current = true;
       }
       const result = new Promise<string>((resolve, reject) => {
@@ -573,7 +630,9 @@ export default function App() {
       });
       try {
         await control.selfTest();
+        operationGateRef.current.assertCurrent(operation.generation);
         setCalibrationProgress(await result);
+        operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
         const waiter = selfTestWaiterRef.current;
         if (waiter) {
@@ -583,20 +642,24 @@ export default function App() {
         throw error;
       }
     } catch (error) {
-      setOperationError(error instanceof Error ? error.message : String(error));
+      if (operationGateRef.current.isCurrent(operation.generation)) {
+        setOperationError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
-      setBusy(false);
+      finishMissionOperation(operation.generation, operation.settle);
     }
   }
 
   async function onArm() {
+    const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
     try {
       const { control } = await ensureMissionResources();
+      operationGateRef.current.assertCurrent(operation.generation);
       const candidate = setupReducer({
         ...setup,
-        loggingReady: Boolean(loggerRef.current) || !setup.wet,
+        loggingReady: isAuthoritativeLogReady(loggerRef.current) || !setup.wet,
       }, { type: 'REQUEST_ARM' });
       if (candidate.phase !== 'arming') {
         throw new Error(candidate.validationError ?? 'Readiness checks did not pass.');
@@ -605,41 +668,52 @@ export default function App() {
       if (!setup.rectangle) throw new Error('Rectangle is missing.');
       const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
       await control.configure(setup.rectangle, wire);
+      operationGateRef.current.assertCurrent(operation.generation);
       rectangleConfiguredRef.current = true;
+      const currentReadiness = setupRef.current.readiness;
+      if (!trackingOkRef.current || !currentReadiness.poseStable || !currentReadiness.atStart) {
+        throw new Error('Readiness changed during Configure; Stop and return to the rectangle start.');
+      }
       await control.arm();
+      operationGateRef.current.assertCurrent(operation.generation);
       dispatch({ type: 'ARM_ACKNOWLEDGED' });
       recordLog({ type: 'state', phoneMs: Date.now(), state: 'ARMED' });
     } catch (error) {
+      if (!operationGateRef.current.isCurrent(operation.generation)) return;
       const message = error instanceof Error ? error.message : String(error);
       if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Arm' });
       else dispatch({ type: 'MISSION_FAULT', cause: message });
-      await handleMissionFault(message);
+      void handleMissionFault(message);
     } finally {
-      setBusy(false);
+      finishMissionOperation(operation.generation, operation.settle);
     }
   }
 
   async function onStart() {
     const control = controlRef.current;
     if (!control) return;
+    const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
     dispatch({ type: 'REQUEST_START' });
     try {
       await control.start();
+      operationGateRef.current.assertCurrent(operation.generation);
       dispatch({ type: 'START_ACKNOWLEDGED' });
       recordLog({ type: 'state', phoneMs: Date.now(), state: 'RUNNING' });
     } catch (error) {
+      if (!operationGateRef.current.isCurrent(operation.generation)) return;
       const message = error instanceof Error ? error.message : String(error);
       if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Start' });
       else dispatch({ type: 'MISSION_FAULT', cause: message });
-      await handleMissionFault(message);
+      void handleMissionFault(message);
     } finally {
-      setBusy(false);
+      finishMissionOperation(operation.generation, operation.settle);
     }
   }
 
   async function onStop() {
+    const pendingOperation = cancelActiveMissionOperation();
     setBusy(true);
     setOperationError(null);
     try {
@@ -649,6 +723,8 @@ export default function App() {
     } catch (error) {
       setOperationError(`Stop acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
+      await pendingOperation;
+      activeOperationSettledRef.current = null;
       dispatch({ type: 'STOP' });
       await releaseMissionResources(true);
       setTelemetry(null);

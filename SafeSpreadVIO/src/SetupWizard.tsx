@@ -241,10 +241,11 @@ export default function SetupWizard(props: SetupWizardProps) {
                 />
                 <Button label="Set opposite B" disabled={!state.cornerA || !props.cameraPose || !state.readiness.poseStable} onPress={captureB} />
               </View>
-              {state.rectangle?.side === 'left' && !state.coverageSideConfirmed ? (
-                <Button label="Confirm LEFT coverage" tone="secondary" onPress={() => props.dispatch({ type: 'CONFIRM_COVERAGE_SIDE' })} />
-              ) : null}
             </>
+          ) : null}
+
+          {state.rectangle?.side === 'left' && !state.coverageSideConfirmed ? (
+            <Button label="Use LEFT coverage (flip)" tone="secondary" onPress={() => props.dispatch({ type: 'CONFIRM_COVERAGE_SIDE' })} />
           ) : null}
 
           <View style={styles.row}>
