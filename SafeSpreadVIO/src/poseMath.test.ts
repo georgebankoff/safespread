@@ -1,3 +1,4 @@
+import { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 import { applyOrigin, cameraToRover, Pose, roverToSprayBar } from './poseMath';
 
 const baseCalibration = {
@@ -78,5 +79,18 @@ describe('roverToSprayBar', () => {
     expect(spray.x).toBeCloseTo(9);
     expect(spray.y).toBeCloseTo(4.5);
     expect(spray.heading).toBe(90);
+  });
+
+  it('uses the measured mount to locate the rear axle and spray bar by default', () => {
+    const rover = cameraToRover(
+      { x: 0, y: 1.75, heading: 0 },
+      DEFAULT_MOUNT_CALIBRATION,
+    );
+    const spray = roverToSprayBar(rover, DEFAULT_MOUNT_CALIBRATION);
+
+    expect(rover.x).toBeCloseTo(0);
+    expect(rover.y).toBeCloseTo(0);
+    expect(spray.x).toBeCloseTo(0);
+    expect(spray.y).toBeCloseTo(-2.5 / 12);
   });
 });

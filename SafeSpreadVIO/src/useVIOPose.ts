@@ -7,18 +7,11 @@ import {
   TrackingReason,
   TrackingState,
 } from '../modules/arkit-pose/src/ArkitPose.types';
+import { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 import { MountCalibration } from './poseMath';
 import { PoseDecision, PosePipeline, PoseReadiness, ValidatedPose } from './posePipeline';
 
-export const DEFAULT_MOUNT_CALIBRATION: MountCalibration = {
-  id: 0,
-  schemaVersion: 1,
-  cameraForwardFt: 0,
-  cameraRightFt: 0,
-  cameraYawDeg: 0,
-  sprayForwardFt: 0,
-  sprayRightFt: 0,
-};
+export { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 
 function monotonicNow(): number {
   return globalThis.performance?.now() ?? Date.now();

@@ -45,13 +45,16 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
     let t = frame.camera.transform
     let metersToFeet = 3.28084
 
-    // ARKit: camera looks down its local -Z. Our convention: y = forward
-    // (world -Z), x = right (world +X), heading 0=+Y, 90=+X.
+    // Ground-plane convention: y = forward (world -Z), x = right
+    // (world +X), heading 0=+Y, 90=+X.
     let xFt = Double(t.columns.3.x) * metersToFeet
     let yFt = Double(-t.columns.3.z) * metersToFeet
 
-    let forwardX = Double(-t.columns.2.x)
-    let forwardZ = Double(-t.columns.2.z)
+    // ARCamera's local +X axis follows the phone's long axis from its top
+    // (front-camera end) toward its bottom. Project local -X onto the pavement
+    // so heading follows the phone top despite the fixed 45-degree pitch.
+    let forwardX = Double(-t.columns.0.x)
+    let forwardZ = Double(-t.columns.0.z)
     var headingDeg = atan2(forwardX, -forwardZ) * 180.0 / Double.pi
     if headingDeg < 0 { headingDeg += 360 }
 
