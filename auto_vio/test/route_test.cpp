@@ -1,0 +1,409 @@
+#include <cassert>
+#include <cstdio>
+#include <cmath>
+#include <cstring>
+#include "../headland.h"
+#include "../route.h"
+
+static const float BAR     = 21.0f / 12.0f;
+static const float OVERLAP = 0.0f;
+// The rover's measured circles, which are not the same size.
+static const float RL = 5.54f;
+static const float RR = 5.05f;
+
+static RoutePoint pts[6000];
+static RoutePoint sim[6000];
+
+/** Curvature the travel path actually gets after the measured steering map
+ *  saturates. Reversing swaps which physical lock produces a given path bend,
+ *  which matters because this rover's left and right circles are unequal. */
+static float appliedPathKappa(float requested, bool reverse) {
+  float steering = reverse ? -requested : requested;
+  if (steering > 1.0f / RR) steering = 1.0f / RR;
+  if (steering < -1.0f / RL) steering = -1.0f / RL;
+  return reverse ? -steering : steering;
+}
+
+// Drive a simulated Ackermann rover, with the rover's real asymmetric radii,
+// along the whole plan -- reversing legs included. This is the part that used
+// to fail on grass with no way to see why.
+static void simulatePrepared(float passLength, float width,
+                             const char *label, int n) {
+  const float STEP           = 0.15f;   // ft per tick
+  const float LINE_T         = 1.5f;    // straight-run convergence constant
+  const float LOOKAHEAD_TURN = 1.0f;    // shorter than the tightest radius
+  const float CUSP_TOL       = 0.1f;
+  const int   WINDOW         = 80;
+  const float SPRAY_OFF      = 1.5f;
+  const float SPRAY_OFF_1ST  = 3.0f;
+
+  int lanes = laneCount(width, BAR, OVERLAP);
+  assert(n > 20);
+
+  int firstPassEnd = n;
+  for (int i = 0; i < n; i++) if (!sim[i].spray) { firstPassEnd = i; break; }
+
+  float x = sim[0].x, y = sim[0].y, heading = 0.0f;
+  int idx = 0, ticks = 0, stuck = 0;
+  float worstOff = 0.0f, worstStraight = 0.0f;
+  int worstStraightIdx = 0;
+  float worstStraightX = x, worstStraightY = y;
+  bool firstPassGap = false;
+  float sprayedFt = 0.0f;
+
+  while (idx < n - 1 && ticks < 80000) {
+    int prevIdx = idx;
+    idx = advanceRouteIndex(sim, n, idx, x, y, WINDOW, CUSP_TOL);
+    stuck = (idx == prevIdx) ? stuck + 1 : 0;
+    assert(stuck < 400);            // never wedged against a cusp
+
+    bool rev = sim[idx].reverse;
+    float reference = rev ? fmodf(heading + 180.0f, 360.0f) : heading;
+    float requestedCurvature, crossNow = 0.0f;
+
+    if (sim[idx].turning) {
+      int la = lookaheadWithinSegment(sim, n, idx, x, y, LOOKAHEAD_TURN);
+      float dx = sim[la].x - x, dy = sim[la].y - y;
+      float want = bearingToWaypointDeg(dx, dy);
+      requestedCurvature = purePursuitCurvature(
+          angleDiffDeg(want, reference), std::sqrt(dx * dx + dy * dy));
+    } else {
+      // The same law the firmware uses on straight runs.
+      float lineHeading = segmentHeadingDeg(sim, n, idx);
+      crossNow = crossTrackFt(sim[idx].x, sim[idx].y, lineHeading, x, y);
+      float headingErr = angleDiffDeg(lineHeading, reference);
+      requestedCurvature = lineFollowCurvature(crossNow, headingErr, LINE_T);
+    }
+
+    // Both driving forward and backing up, the travel direction turns the same
+    // way for a given command: the firmware mirrors the steering in reverse and
+    // the physics mirrors it back.
+    float turn = appliedPathKappa(requestedCurvature, rev) *
+                 STEP * 180.0f / (float)M_PI;
+    heading = fmodf(heading + turn + 360.0f, 360.0f);
+    float rad = heading * (float)M_PI / 180.0f;
+    float sgn = rev ? -1.0f : 1.0f;
+    x += sgn * STEP * sinf(rad);
+    y += sgn * STEP * cosf(rad);
+
+    float offX = sim[idx].x - x, offY = sim[idx].y - y;
+    float off = sqrtf(offX * offX + offY * offY);
+    if (off > worstOff) worstOff = off;
+
+    // Sideways error while actually spraying is what decides whether the
+    // strips land side by side or on top of each other.
+    if (sim[idx].spray && fabsf(crossNow) > worstStraight) {
+      worstStraight = fabsf(crossNow);
+      worstStraightIdx = idx;
+      worstStraightX = x;
+      worstStraightY = y;
+    }
+
+    float limit = (idx < firstPassEnd) ? SPRAY_OFF_1ST : SPRAY_OFF;
+    bool spraying = sim[idx].spray && off <= limit;
+    if (spraying) sprayedFt += STEP;
+
+    // The first pass must spray without interruption along its length.
+    if (idx < firstPassEnd && !spraying && y > 0.5f && y < passLength - 0.5f) {
+      firstPassGap = true;
+    }
+    ticks++;
+  }
+
+  assert(idx >= n - 2);          // reached the end of the plan
+  assert(worstOff < 1.5f);       // never wandered far from it
+  assert(!firstPassGap);         // first pass sprayed end to end
+
+  if (worstStraight >= 0.5f * laneSpacing(BAR, OVERLAP)) {
+    std::printf("route_test: %s excessive spray error %.2f ft at point %d "
+                "(actual %.2f,%.2f target %.2f,%.2f)\n",
+                label, worstStraight, worstStraightIdx,
+                worstStraightX, worstStraightY,
+                sim[worstStraightIdx].x, sim[worstStraightIdx].y);
+  }
+
+  // While spraying, the rover must stay inside half a lane width of its line.
+  // Beyond that, neighbouring strips start landing on top of each other --
+  // which is what "it drives back over what it just covered" looks like.
+  assert(worstStraight < 0.5f * laneSpacing(BAR, OVERLAP));
+
+  float wanted = lanes * passLength;
+  assert(sprayedFt > 0.92f * wanted);
+
+  printf("route_test: %s -> %d ticks, worst %.2f ft off plan, "
+         "%.2f ft sideways while spraying, sprayed %.0f/%.0f ft\n",
+         label, ticks, worstOff, worstStraight, sprayedFt, wanted);
+}
+
+static void simulateFollow(float field, const char *label) {
+  int n = buildRoute(field, field, BAR, OVERLAP, RL, RR, sim, 6000);
+  simulatePrepared(field, field, label, n);
+}
+
+int main() {
+  // --- lane geometry ------------------------------------------------------
+  {
+    // The first lane sits under the rover, so placing the rover is how the
+    // first pass gets aimed.
+    assert(fabsf(laneCenterX(0, BAR, OVERLAP)) < 0.001f);
+
+    assert(laneCount(10.0f, 2.0f, 0.0f) == 5);
+    assert(fabsf(laneCenterX(4, 2.0f, 0.0f) - 8.0f) < 0.001f);
+
+    // Lanes stop before the far edge: a width not divisible by the bar is
+    // under-covered at the far side, never overrun.
+    int m = laneCount(9.0f, 2.0f, 0.0f);
+    float band = (laneCenterX(m - 1, 2.0f, 0.0f) + 1.0f) - (laneCenterX(0, 2.0f, 0.0f) - 1.0f);
+    assert(band <= 9.0f + 0.001f);
+
+    assert(laneCount(1.0f, 2.0f, 0.0f) == 1);
+    printf("route_test: lane geometry ok (10ft/2ft bar = 5 lanes, real = %d)\n",
+           laneCount(21.91f, BAR, OVERLAP));
+  }
+
+  // --- the real field -----------------------------------------------------
+  int n = 0, lanes = 0;
+  const float FIELD = 21.91f;
+  {
+    n = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, pts, 6000);
+    lanes = laneCount(FIELD, BAR, OVERLAP);
+    assert(n > 100 && n < 6000);
+
+    // Every lane must actually get sprayed somewhere along its length.
+    for (int lane = 0; lane < lanes; lane++) {
+      float laneX = laneCenterX(lane, BAR, OVERLAP);
+      bool covered = false;
+      for (int i = 0; i < n; i++) {
+        if (pts[i].spray && fabsf(pts[i].x - laneX) < 0.05f) { covered = true; break; }
+      }
+      assert(covered);
+    }
+
+    // Spray must never be commanded outside the rectangle, and never while
+    // backing up.
+    for (int i = 0; i < n; i++) {
+      if (!pts[i].spray) continue;
+      assert(pts[i].y >= -0.01f && pts[i].y <= FIELD + 0.01f);
+      assert(pts[i].x >= -0.01f && pts[i].x <= FIELD + 0.01f);
+      assert(!pts[i].reverse);
+    }
+
+    // Consecutive points stay close enough to follow.
+    for (int i = 1; i < n; i++) {
+      float dx = pts[i].x - pts[i - 1].x, dy = pts[i].y - pts[i - 1].y;
+      assert(sqrtf(dx * dx + dy * dy) <= ROUTE_STEP_FT * 2.5f);
+    }
+
+    // The route begins under the rover, already spraying.
+    assert(fabsf(pts[0].x) < 0.01f && fabsf(pts[0].y) < 0.01f);
+    assert(pts[0].spray && !pts[0].reverse);
+
+    int reversals = 0;
+    for (int i = 1; i < n; i++) if (pts[i].reverse != pts[i - 1].reverse) reversals++;
+    assert(reversals > 0);   // it really is using three-point turns
+    printf("route_test: real field -> %d points, %d lanes, %d direction changes\n",
+           n, lanes, reversals);
+  }
+
+  // --- the first pass sprays from end to end ------------------------------
+  // This is the pass the user cares most about, and the one most at risk:
+  // it sits on x=0, so any test based on being inside the rectangle clips it.
+  {
+    int firstPassEnd = n;
+    for (int i = 0; i < n; i++) if (!pts[i].spray) { firstPassEnd = i; break; }
+
+    assert(firstPassEnd > 2);
+    for (int i = 0; i < firstPassEnd; i++) {
+      assert(pts[i].spray);
+      assert(fabsf(pts[i].x) < 0.01f);          // dead straight
+    }
+    // and it runs the full length of the field
+    assert(fabsf(pts[0].y) < 0.01f);
+    assert(fabsf(pts[firstPassEnd - 1].y - FIELD) < 0.01f);
+    printf("route_test: first pass sprays %d points, 0.0 -> %.2f ft, unbroken\n",
+           firstPassEnd, pts[firstPassEnd - 1].y);
+  }
+
+  // --- how far outside the rectangle the route reaches --------------------
+  {
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (int i = 0; i < n; i++) {
+      if (pts[i].x < minX) minX = pts[i].x;
+      if (pts[i].x > maxX) maxX = pts[i].x;
+      if (pts[i].y < minY) minY = pts[i].y;
+      if (pts[i].y > maxY) maxY = pts[i].y;
+    }
+    // Turns must not swing wildly off the plot; anything much beyond a
+    // margin plus a turning radius would need clearance the user may not have.
+    assert(maxY <= FIELD + HEADLAND_MARGIN_FT + RL + 0.5f);
+    assert(minY >= -(HEADLAND_MARGIN_FT + RL + 0.5f));
+    printf("route_test: route spans x %.1f..%.1f, y %.1f..%.1f "
+           "(needs %.1f ft clear beyond each end)\n",
+           minX, maxX, minY, maxY, maxY - FIELD);
+  }
+
+  // --- a small plot still produces a complete route -----------------------
+  {
+    static RoutePoint small[6000];
+    int sn = buildRoute(10.0f, 10.0f, BAR, OVERLAP, RL, RR, small, 6000);
+    assert(sn > 50);
+    int sl = laneCount(10.0f, BAR, OVERLAP);
+    for (int lane = 0; lane < sl; lane++) {
+      float laneX = laneCenterX(lane, BAR, OVERLAP);
+      bool covered = false;
+      for (int i = 0; i < sn; i++) {
+        if (small[i].spray && fabsf(small[i].x - laneX) < 0.05f) { covered = true; break; }
+      }
+      assert(covered);
+    }
+    printf("route_test: 10x10 -> %d points, %d lanes\n", sn, sl);
+  }
+
+  // --- a one-lane area is a straight-line test ----------------------------
+  // Setting the width to less than one bar gives a single pass and nothing
+  // else, which isolates the tracker: no turns, no lane stepping, just "can
+  // this rover hold a line". Worth guaranteeing, since it is the first thing
+  // to check when coverage looks wrong.
+  {
+    static RoutePoint line[6000];
+    int ln = buildRoute(20.0f, 1.0f, BAR, OVERLAP, RL, RR, line, 6000);
+    assert(laneCount(1.0f, BAR, OVERLAP) == 1);
+    assert(ln > 10);
+    for (int i = 0; i < ln; i++) {
+      assert(line[i].spray);            // sprays the whole way
+      assert(!line[i].reverse);         // never backs up
+      assert(!line[i].turning);         // and never turns
+      assert(fabsf(line[i].x) < 0.01f); // dead straight along x=0
+    }
+    assert(fabsf(line[0].y) < 0.01f);
+    assert(fabsf(line[ln - 1].y - 20.0f) < 0.01f);
+    printf("route_test: 20x1 -> %d points, one straight sprayed pass\n", ln);
+  }
+
+  // --- following the route, reversing included ----------------------------
+  // Every direction change must be represented by the exact geometric cusp,
+  // not whichever half-foot route sample happened to fall nearest it.
+  {
+    TurnPlan p;
+    assert(planHeadlandTurn(laneSpacing(BAR, OVERLAP), RL, RR, p));
+    RoutePoint emitted[100];
+    const int emittedCount = emitTurn(emitted, 100, p, 0.0f, 0.0f, 0.0f);
+    float distance = 0.0f;
+    for (int leg = 0; leg + 1 < p.legCount; ++leg) {
+      distance += turnLegLength(p.leg[leg]);
+      float x, y, heading; bool reverse;
+      turnPoseAt(p, distance, x, y, heading, reverse);
+      bool found = false;
+      for (int point = 0; point < emittedCount; ++point) {
+        if (std::fabs(emitted[point].x - x) < 1e-4f &&
+            std::fabs(emitted[point].y - y) < 1e-4f &&
+            emitted[point].reverse == p.leg[leg].reverse) {
+          found = true;
+          break;
+        }
+      }
+      assert(found);
+    }
+  }
+
+  simulateFollow(FIELD, "real field");
+  simulateFollow(14.0f, "14x14");
+  simulateFollow(10.0f, "10x10");
+  simulateFollow(6.0f, "6x6");
+
+  // --- retain forward-only planning, but select the compact route ----------
+  {
+    static RoutePoint selected[6000];
+    const int forwardCount = buildForwardOnlyRoute(
+        FIELD, FIELD, BAR, OVERLAP, RL, RR, selected, 6000);
+    const RouteRequirements forward = inspectRoute(selected, forwardCount, FIELD);
+    assert(forwardCount > 0 && !forward.truncated);
+    assert(forward.reversals == 0);
+    float forwardMinX = selected[0].x, forwardMaxX = selected[0].x;
+    for (int i = 1; i < forwardCount; ++i) {
+      if (selected[i].x < forwardMinX) forwardMinX = selected[i].x;
+      if (selected[i].x > forwardMaxX) forwardMaxX = selected[i].x;
+    }
+    std::printf("route_test: forward-only -> %d points, needs %.1f/%.1f ft headland, x %.1f..%.1f\n",
+                forwardCount, forward.beforeStartFt,
+                forward.beyondEndFt, forwardMinX, forwardMaxX);
+    for (int i = 0; i < forwardCount; ++i) assert(!selected[i].reverse);
+
+    // The far-lane ordering changes visit order, never lane placement: every
+    // lane at the configured zero-overlap spacing still receives a full pass.
+    for (int lane = 0; lane < lanes; ++lane) {
+      const float laneX = laneCenterX(lane, BAR, OVERLAP);
+      bool covered = false;
+      for (int i = 0; i < forwardCount; ++i) {
+        if (selected[i].spray && std::fabs(selected[i].x - laneX) < 0.05f) {
+          covered = true;
+          break;
+        }
+      }
+      assert(covered);
+    }
+
+    // Exercise the selected forward-only plan through the same tracker model
+    // as the reversing route. Geometry alone cannot prove that its longer
+    // Dubins transitions remain followable by the production control law.
+    std::memcpy(sim, selected, forwardCount * sizeof(RoutePoint));
+    simulatePrepared(FIELD, FIELD, "forward-only", forwardCount);
+
+    static RoutePoint kturn[6000];
+    int kCount = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, kturn, 6000);
+    RouteRequirements kNeeds = inspectRoute(kturn, kCount, FIELD);
+    assert(forward.beforeStartFt > kNeeds.beforeStartFt + 0.01f ||
+           forward.beyondEndFt > kNeeds.beyondEndFt + 0.01f);
+
+    RouteSelection compact = selectRoute(
+        FIELD, FIELD, BAR, OVERLAP, RL, RR,
+        100.0f, 100.0f,
+        true, selected, 6000);
+    assert(compact.style == ROUTE_THREE_POINT);
+    assert(compact.count == kCount);
+    assert(compact.requirements.reversals > 0);
+  }
+
+  // The shipping 40x12 setup with 8 ft at each end must choose the compact
+  // reversing route and remain inside the entered headland.
+  {
+    static RoutePoint plan[6000];
+    RouteSelection selected = selectRoute(
+        40.0f, 12.0f, BAR, OVERLAP, RL, RR,
+        8.0f, 8.0f, true, plan, 6000);
+    assert(selected.style == ROUTE_THREE_POINT);
+    assert(selected.count > 0 && !selected.requirements.truncated);
+    assert(selected.requirements.beforeStartFt <= 8.0f);
+    assert(selected.requirements.beyondEndFt <= 8.0f);
+    std::memcpy(sim, plan, selected.count * sizeof(RoutePoint));
+    simulatePrepared(40.0f, 12.0f, "default 40x12", selected.count);
+    std::printf("route_test: default 40x12 -> needs %.2f/%.2f ft headland\n",
+                selected.requirements.beforeStartFt,
+                selected.requirements.beyondEndFt);
+  }
+
+  // Passes are addressable so a faulted mission can resume on the one it was
+  // driving instead of re-covering the whole rectangle.
+  {
+    const float FIELD = 24.0f;
+    static RoutePoint plan[6000];
+    const int count = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, plan, 6000);
+    const int lanes = laneCount(FIELD, BAR, OVERLAP);
+    assert(routePassCount(plan, count) == lanes);
+    assert(routePassStartIndex(plan, count, 0) == 0);
+    assert(routePassStartIndex(plan, count, lanes) == -1);
+    assert(routePassStartIndex(plan, count, -1) == -1);
+    for (int pass = 0; pass < lanes; ++pass) {
+      const int start = routePassStartIndex(plan, count, pass);
+      assert(start >= 0 && plan[start].spray);
+      assert(start == 0 || !plan[start - 1].spray);
+      if (pass > 0) assert(start > routePassStartIndex(plan, count, pass - 1));
+      // Resuming lands the rover on the lane it is about to spray.
+      assert(std::fabs(plan[start].x - laneCenterX(pass, BAR, OVERLAP)) < 0.05f);
+      assert(routePassIndexAt(plan, count, start) == pass);
+    }
+  }
+
+  printf("route_test: all assertions passed\n");
+  return 0;
+}

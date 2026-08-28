@@ -1,0 +1,4 @@
+.DS_Store
+node_modules/
+.expo/
+auto_vio/build/
