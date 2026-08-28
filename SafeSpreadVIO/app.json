@@ -1,14 +1,14 @@
 {
   "expo": {
-    "name": "SafeSpreadVIO",
-    "slug": "SafeSpreadVIO",
+    "name": "SafeSpread OBSOLETE",
+    "slug": "SafeSpreadVIO-obsolete-lima",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.safespread.vio",
+      "bundleIdentifier": "com.safespread.vio.obsolete.lima",
       "infoPlist": {
         "NSCameraUsageDescription": "SafeSpreadVIO uses the camera for visual-inertial position tracking.",
         "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth."
